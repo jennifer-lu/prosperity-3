@@ -1,5 +1,7 @@
 from datamodel import OrderDepth, UserId, TradingState, Order
 from typing import List
+import collections
+from collections import OrderedDict
 import string
 import jsonpickle
 import numpy as np
@@ -8,7 +10,7 @@ import math
 import json
 from typing import Any
 
-from logger import Logger
+# from logger import Logger
 
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
@@ -32,7 +34,7 @@ PARAMS = {
         "disregard_edge": 1,  # disregards orders for joining or pennying within this value from fair
         "join_edge": 2,  # joins orders within this edge
         "default_edge": 4,
-        "soft_position_limit": 10,
+        "soft_position_limit": 35,
     },
     Product.SQUID_INK: {
         "take_width": 1,
@@ -65,6 +67,9 @@ class Trader:
 
         self.LIMIT = {Product.RAINFOREST_RESIN: 20, Product.SQUID_INK: 20, Product.KELP: 20}
 
+        self.kelp_cache = []
+        self.kelp_dim = 4
+        
     def take_best_orders(
         self,
         product: str,
@@ -180,43 +185,44 @@ class Trader:
         return buy_order_volume, sell_order_volume
 
     def KELP_fair_value(self, order_depth: OrderDepth, traderObject) -> float:
-        if len(order_depth.sell_orders) != 0 and len(order_depth.buy_orders) != 0:
-            best_ask = min(order_depth.sell_orders.keys())
-            best_bid = max(order_depth.buy_orders.keys())
-            filtered_ask = [
-                price
-                for price in order_depth.sell_orders.keys()
-                if abs(order_depth.sell_orders[price])
-                >= self.params[Product.KELP]["adverse_volume"]
-            ]
-            filtered_bid = [
-                price
-                for price in order_depth.buy_orders.keys()
-                if abs(order_depth.buy_orders[price])
-                >= self.params[Product.KELP]["adverse_volume"]
-            ]
-            mm_ask = min(filtered_ask) if len(filtered_ask) > 0 else None
-            mm_bid = max(filtered_bid) if len(filtered_bid) > 0 else None
-            if mm_ask == None or mm_bid == None:
-                if traderObject.get("KELP_last_price", None) == None:
-                    mmmid_price = (best_ask + best_bid) / 2
-                else:
-                    mmmid_price = traderObject["KELP_last_price"]
-            else:
-                mmmid_price = (mm_ask + mm_bid) / 2
+        # if len(order_depth.sell_orders) != 0 and len(order_depth.buy_orders) != 0:
+        #     best_ask = min(order_depth.sell_orders.keys())
+        #     best_bid = max(order_depth.buy_orders.keys())
+        #     filtered_ask = [
+        #         price
+        #         for price in order_depth.sell_orders.keys()
+        #         if abs(order_depth.sell_orders[price])
+        #         >= self.params[Product.KELP]["adverse_volume"]
+        #     ]
+        #     filtered_bid = [
+        #         price
+        #         for price in order_depth.buy_orders.keys()
+        #         if abs(order_depth.buy_orders[price])
+        #         >= self.params[Product.KELP]["adverse_volume"]
+        #     ]
+        #     mm_ask = min(filtered_ask) if len(filtered_ask) > 0 else None
+        #     mm_bid = max(filtered_bid) if len(filtered_bid) > 0 else None
+        #     if mm_ask == None or mm_bid == None:
+        #         if traderObject.get("KELP_last_price", None) == None:
+        #             mmmid_price = (best_ask + best_bid) / 2
+        #         else:
+        #             mmmid_price = traderObject["KELP_last_price"]
+        #     else:
+        #         mmmid_price = (mm_ask + mm_bid) / 2
 
-            if traderObject.get("KELP_last_price", None) != None:
-                last_price = traderObject["KELP_last_price"]
-                last_returns = (mmmid_price - last_price) / last_price
-                pred_returns = (
-                    last_returns * self.params[Product.KELP]["reversion_beta"]
-                )
-                fair = mmmid_price + (mmmid_price * pred_returns)
-            else:
-                fair = mmmid_price
-            traderObject["KELP_last_price"] = mmmid_price
-            return fair
-        return None
+        #     if traderObject.get("KELP_last_price", None) != None:
+        #         last_price = traderObject["KELP_last_price"]
+        #         last_returns = (mmmid_price - last_price) / last_price
+        #         pred_returns = (
+        #             last_returns * self.params[Product.KELP]["reversion_beta"]
+        #         )
+        #         fair = mmmid_price + (mmmid_price * pred_returns)
+        #     else:
+        #         fair = mmmid_price
+        #     traderObject["KELP_last_price"] = mmmid_price
+        #     return fair
+        fair = sum(self.kelp_cache) / len(self.kelp_cache)
+        return round(fair)
     
     def SQUID_INK_fair_value(self, order_depth: OrderDepth, traderObject) -> float:
         if len(order_depth.sell_orders) != 0 and len(order_depth.buy_orders) != 0:
@@ -371,13 +377,23 @@ class Trader:
         return orders, buy_order_volume, sell_order_volume
 
     def run(self, state: TradingState):
-        logger = Logger()
+        # logger = Logger()
 
         traderObject = {}
         if state.traderData != None and state.traderData != "":
             traderObject = jsonpickle.decode(state.traderData)
 
         result = {}
+
+        if len(self.kelp_cache) == self.kelp_dim:
+            self.kelp_cache.pop(0)
+
+
+        if "KELP" in state.listings.keys():
+            bs_kelp = max(collections.OrderedDict(sorted(state.order_depths['KELP'].sell_orders.items())))
+            bb_kelp = min(collections.OrderedDict(sorted(state.order_depths['KELP'].buy_orders.items(), reverse=True)))
+
+            self.kelp_cache.append((bs_kelp+bb_kelp)/2)
 
         if Product.RAINFOREST_RESIN in self.params and Product.RAINFOREST_RESIN in state.order_depths:
             amethyst_position = (
@@ -517,5 +533,5 @@ class Trader:
         conversions = 1
         traderData = jsonpickle.encode(traderObject)
 
-        logger.flush(state, result, conversions, traderData)
+        # logger.flush(state, result, conversions, traderData)
         return result, conversions, traderData
