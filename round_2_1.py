@@ -1,6 +1,7 @@
 from typing import Any, List
 import json
 import jsonpickle
+import numpy as np
 
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
@@ -198,17 +199,21 @@ PARAMS = {
         "disregard_edge": 2,
         "join_edge": 0,
         "default_edge": 2,
-        "synthetic_weight": 0.5,
+        "synthetic_weight": 0.05,
+        "volatility_window_size": 10,
+        "adverse_volatility": 0.1,
     },
     Product.PICNIC_BASKET2: {
-        "take_width": 10,
+        "take_width": 2,
         "clear_width": 0,
         "prevent_adverse": True,
         "adverse_volume": 15,
-        "disregard_edge": 10,
+        "disregard_edge": 2,
         "join_edge": 0,
-        "default_edge": 10,
-        "synthetic_weight": 0.2,
+        "default_edge": 2,
+        "synthetic_weight": 0.01,
+        "volatility_window_size": 10,
+        "adverse_volatility": 0.1,
     },
 }
 
@@ -422,13 +427,17 @@ class Trader:
         order_depth: OrderDepth,
         djembes_order_depth: OrderDepth,
         croissants_order_depth: OrderDepth,
-        jams_order_depth: OrderDepth
+        jams_order_depth: OrderDepth,
+        position: int,
+        traderObject
     ) -> float:
         mid = self.filtered_mid(Product.PICNIC_BASKET1, order_depth)
         djembes_mid = self.filtered_mid(Product.DJEMBES, djembes_order_depth)
         croissants_mid = self.filtered_mid(Product.CROISSANTS, croissants_order_depth)
         jams_mid = self.filtered_mid(Product.JAMS, jams_order_depth)
-        
+
+        if mid is None:
+            return None
         if djembes_mid is None or croissants_mid is None or jams_mid is None:
             return mid
         
@@ -437,23 +446,55 @@ class Trader:
             croissants_mid * BASKET1_WEIGHTS[Product.CROISSANTS] + 
             jams_mid * BASKET1_WEIGHTS[Product.JAMS]
         )
+        
+        # code to check spread volatility
+        # idea: if the spread between synthetic and real recently changed a lot,
+        # don't trade based on the synthetic mid
 
-        if mid is None:
-            return basket1_synthetic_mid
+        # synthetic_spread = abs(basket1_synthetic_mid - mid)
+        # if "basket1_synthetic_spread_history" not in traderObject:
+        #     traderObject["basket1_synthetic_spread_history"] = []
+        # traderObject["basket1_synthetic_spread_history"].append(synthetic_spread)
+        # window_size = self.params[Product.PICNIC_BASKET1]["volatility_window_size"]
+        # spread_history = traderObject["basket1_synthetic_spread_history"][-window_size:]
+        # traderObject["basket1_synthetic_spread_history"] = spread_history
+
+        # if (len(spread_history) < window_size):
+        #     return mid
+        
+        # spread_history = np.array(spread_history, dtype=float)
+        # prev = spread_history[:-1]
+        # curr = spread_history[1:]
+        # with np.errstate(divide='ignore', invalid='ignore'):    # prevent divide-by-zero and log(0)
+        #     ratios = np.where(prev != 0, curr / prev, np.nan)
+        #     log_returns = np.log(ratios)
+        #     clean_log_returns = log_returns[np.isfinite(log_returns)]
+        # spread_volatility = np.std(clean_log_returns)
+
+        # if (spread_volatility > self.params[Product.PICNIC_BASKET1]["adverse_volatility"]):
+        #     return mid
 
         synthetic_weight = self.params[Product.PICNIC_BASKET1]["synthetic_weight"]
+        if abs(position) > self.LIMIT[Product.PICNIC_BASKET1] * 0.7:
+            synthetic_weight *= 0.5
+        if abs(position) == self.LIMIT[Product.PICNIC_BASKET1]:
+            synthetic_weight = 0
         return (1 - synthetic_weight) * mid + synthetic_weight * basket1_synthetic_mid
     
     def basket2_fair_value(
         self,
         order_depth: OrderDepth,
         croissants_order_depth: OrderDepth,
-        jams_order_depth: OrderDepth
+        jams_order_depth: OrderDepth,
+        position: int,
+        traderObject
     ) -> float:
         mid = self.filtered_mid(Product.PICNIC_BASKET1, order_depth)
         croissants_mid = self.filtered_mid(Product.CROISSANTS, croissants_order_depth)
         jams_mid = self.filtered_mid(Product.JAMS, jams_order_depth)
 
+        if mid is None:
+            return None
         if croissants_mid is None or jams_mid is None:
             return mid
         
@@ -462,10 +503,38 @@ class Trader:
             jams_mid * BASKET2_WEIGHTS[Product.JAMS]
         )
 
-        if mid is None:
-            return basket2_synthetic_mid
+        # code to check spread volatility
+        # idea: if the spread between synthetic and real recently changed a lot,
+        # don't trade based on the synthetic mid
+
+        # synthetic_spread = abs(basket2_synthetic_mid - mid)
+        # if "basket2_synthetic_spread_history" not in traderObject:
+        #     traderObject["basket2_synthetic_spread_history"] = []
+        # traderObject["basket2_synthetic_spread_history"].append(synthetic_spread)
+        # window_size = self.params[Product.PICNIC_BASKET2]["volatility_window_size"]
+        # spread_history = traderObject["basket2_synthetic_spread_history"][-window_size:]
+        # traderObject["basket2_synthetic_spread_history"] = spread_history
+
+        # if (len(spread_history) < window_size):
+        #     return mid
+        
+        # spread_history = np.array(spread_history, dtype=float)
+        # prev = spread_history[:-1]
+        # curr = spread_history[1:]
+        # with np.errstate(divide='ignore', invalid='ignore'):    # prevent divide-by-zero and log(0)
+        #     ratios = np.where(prev != 0, curr / prev, np.nan)
+        #     log_returns = np.log(ratios)
+        #     clean_log_returns = log_returns[np.isfinite(log_returns)]
+        # spread_volatility = np.std(clean_log_returns)
+
+        # if (spread_volatility > self.params[Product.PICNIC_BASKET2]["adverse_volatility"]):
+        #     return mid
 
         synthetic_weight = self.params[Product.PICNIC_BASKET2]["synthetic_weight"]
+        if abs(position) > self.LIMIT[Product.PICNIC_BASKET2] * 0.7:
+            synthetic_weight *= 0.5
+        if abs(position) == self.LIMIT[Product.PICNIC_BASKET2]:
+            synthetic_weight = 0
         return (1 - synthetic_weight) * mid + synthetic_weight * basket2_synthetic_mid
 
     def take_orders(
@@ -685,7 +754,9 @@ class Trader:
                 state.order_depths[Product.PICNIC_BASKET1],
                 state.order_depths[Product.DJEMBES],
                 state.order_depths[Product.CROISSANTS],
-                state.order_depths[Product.JAMS]
+                state.order_depths[Product.JAMS],
+                basket1_position,
+                traderObject
             )
             basket1_take_orders, buy_order_volume, sell_order_volume = self.take_orders(
                 Product.PICNIC_BASKET1,
@@ -729,7 +800,9 @@ class Trader:
             basket2_fair_value = self.basket2_fair_value(
                 state.order_depths[Product.PICNIC_BASKET2],
                 state.order_depths[Product.CROISSANTS],
-                state.order_depths[Product.JAMS]
+                state.order_depths[Product.JAMS],
+                basket2_position,
+                traderObject
             )
             basket2_take_orders, buy_order_volume, sell_order_volume = self.take_orders(
                 Product.PICNIC_BASKET2,
