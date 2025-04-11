@@ -2,6 +2,7 @@ from typing import Any, List
 import json
 import jsonpickle
 import numpy as np
+import math
 
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
@@ -164,14 +165,25 @@ PARAMS = {
         "window_size": 50,
         "deviation_threshold": 0.005,
     },
-    Product.DJEMBES: {
-        "take_width": 1,
+    Product.SQUID_INK: {
+        "take_width": 2,
         "clear_width": 0,
         "prevent_adverse": True,
         "adverse_volume": 15,
-        "disregard_edge": 1,
+        "disregard_edge": 2,
         "join_edge": 0,
-        "default_edge": 1,
+        "default_edge": 2,
+        "window_size": 100,
+        "deviation_threshold": 0.04,
+    },
+    Product.DJEMBES: {
+        "take_width": 2,
+        "clear_width": 0,
+        "prevent_adverse": True,
+        "adverse_volume": 15,
+        "disregard_edge": 2,
+        "join_edge": 0,
+        "default_edge": 2,
     },
     Product.CROISSANTS: {
         "take_width": 1,
@@ -181,6 +193,7 @@ PARAMS = {
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
+        "synthetic_weight": 0.000001,
     },
     Product.JAMS: {
         "take_width": 1,
@@ -190,6 +203,7 @@ PARAMS = {
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
+        "synthetic_weight": 0,
     },
     Product.PICNIC_BASKET1: {
         "take_width": 2,
@@ -211,7 +225,7 @@ PARAMS = {
         "disregard_edge": 2,
         "join_edge": 0,
         "default_edge": 2,
-        "synthetic_weight": 0.01,
+        "synthetic_weight": 0.02,
         "volatility_window_size": 10,
         "adverse_volatility": 0.1,
     },
@@ -397,6 +411,58 @@ class Trader:
             return fair
         return None
     
+    def squid_ink_fair_value(self, order_depth: OrderDepth, traderObject) -> float:
+        if len(order_depth.sell_orders) != 0 and len(order_depth.buy_orders) != 0:
+            best_ask = min(order_depth.sell_orders.keys())
+            best_bid = max(order_depth.buy_orders.keys())
+            filtered_ask = [
+                price
+                for price in order_depth.sell_orders.keys()
+                if abs(order_depth.sell_orders[price])
+                >= self.params[Product.SQUID_INK]["adverse_volume"]
+            ]
+            filtered_bid = [
+                price
+                for price in order_depth.buy_orders.keys()
+                if abs(order_depth.buy_orders[price])
+                >= self.params[Product.SQUID_INK]["adverse_volume"]
+            ]
+            mm_ask = min(filtered_ask) if len(filtered_ask) > 0 else None
+            mm_bid = max(filtered_bid) if len(filtered_bid) > 0 else None
+            if mm_ask == None or mm_bid == None:
+                mmmid_price = (best_ask + best_bid) / 2
+            else:
+                mmmid_price = (mm_ask + mm_bid) / 2
+
+            if "squid_ink_price_history" not in traderObject:
+                traderObject["squid_ink_price_history"] = []
+            traderObject["squid_ink_price_history"].append(mmmid_price)
+            window_size = self.params[Product.SQUID_INK]["window_size"]
+            price_history = traderObject["squid_ink_price_history"][-window_size:]
+            traderObject["squid_ink_price_history"] = price_history
+
+            if len(price_history) == window_size:
+                sorted_price_history = sorted(price_history)
+
+                # take middle 50%
+                lower_index = window_size // 4
+                upper_index = window_size - lower_index
+                middle_prices = sorted_price_history[lower_index:upper_index]  
+                
+                truncated_mean_price = sum(middle_prices) / len(middle_prices)
+
+                deviation = (mmmid_price - truncated_mean_price) / truncated_mean_price
+                deviation_threshold = self.params[Product.SQUID_INK]["deviation_threshold"]
+                if abs(deviation) > deviation_threshold:
+                    fair = (truncated_mean_price + mmmid_price) / 2
+                else:
+                    fair = mmmid_price
+            else:
+                fair = mmmid_price
+
+            return fair
+        return None
+    
     def filtered_mid(
         self,
         product: str,
@@ -474,11 +540,12 @@ class Trader:
         # if (spread_volatility > self.params[Product.PICNIC_BASKET1]["adverse_volatility"]):
         #     return mid
 
+        # put exponentially less weight on synthetic mid if near position limit
         synthetic_weight = self.params[Product.PICNIC_BASKET1]["synthetic_weight"]
-        if abs(position) > self.LIMIT[Product.PICNIC_BASKET1] * 0.7:
-            synthetic_weight *= 0.5
-        if abs(position) == self.LIMIT[Product.PICNIC_BASKET1]:
-            synthetic_weight = 0
+        if abs(position) > 0:
+            position_limit_ratio = abs(position) / self.LIMIT[Product.PICNIC_BASKET1]
+            decay_factor = math.exp(-1 * position_limit_ratio)
+            synthetic_weight *= decay_factor
         return (1 - synthetic_weight) * mid + synthetic_weight * basket1_synthetic_mid
     
     def basket2_fair_value(
@@ -530,12 +597,65 @@ class Trader:
         # if (spread_volatility > self.params[Product.PICNIC_BASKET2]["adverse_volatility"]):
         #     return mid
 
+        # put exponentially less weight on synthetic mid if near position limit
         synthetic_weight = self.params[Product.PICNIC_BASKET2]["synthetic_weight"]
-        if abs(position) > self.LIMIT[Product.PICNIC_BASKET2] * 0.7:
-            synthetic_weight *= 0.5
-        if abs(position) == self.LIMIT[Product.PICNIC_BASKET2]:
-            synthetic_weight = 0
+        if abs(position) > 0:
+            position_limit_ratio = abs(position) / self.LIMIT[Product.PICNIC_BASKET2]
+            decay_factor = math.exp(-1 * position_limit_ratio)
+            synthetic_weight *= decay_factor
         return (1 - synthetic_weight) * mid + synthetic_weight * basket2_synthetic_mid
+
+    def croissants_fair_value(
+        self,
+        order_depth: OrderDepth,
+        basket2_order_depth: OrderDepth,
+        jams_order_depth: OrderDepth,
+        position: int,
+        traderObject
+    ) -> float:
+        mid = self.filtered_mid(Product.CROISSANTS, order_depth)
+        basket2_mid = self.filtered_mid(Product.PICNIC_BASKET2, basket2_order_depth)
+        jams_mid = self.filtered_mid(Product.JAMS, jams_order_depth)
+
+        if mid is None:
+            return None
+        if basket2_mid is None or jams_mid is None:
+            return mid
+        
+        croissants_synthetic_mid = (basket2_mid - (jams_mid * BASKET2_WEIGHTS[Product.JAMS])) / BASKET2_WEIGHTS[Product.CROISSANTS]
+
+        synthetic_weight = self.params[Product.CROISSANTS]["synthetic_weight"]
+        if abs(position) > self.LIMIT[Product.CROISSANTS] * 0.7:
+            synthetic_weight *= 0.5
+        if abs(position) == self.LIMIT[Product.CROISSANTS]:
+            synthetic_weight = 0
+        return (1 - synthetic_weight) * mid + synthetic_weight * croissants_synthetic_mid
+
+    def jams_fair_value(
+        self,
+        order_depth: OrderDepth,
+        basket2_order_depth: OrderDepth,
+        croissants_order_depth: OrderDepth,
+        position: int,
+        traderObject
+    ) -> float:
+        mid = self.filtered_mid(Product.JAMS, order_depth)
+        basket2_mid = self.filtered_mid(Product.PICNIC_BASKET2, basket2_order_depth)
+        croissants_mid = self.filtered_mid(Product.CROISSANTS, croissants_order_depth)
+
+        if mid is None:
+            return None
+        if basket2_mid is None or croissants_mid is None:
+            return mid
+        
+        jams_synthetic_mid = (basket2_mid - (croissants_mid * BASKET2_WEIGHTS[Product.CROISSANTS])) / BASKET2_WEIGHTS[Product.JAMS]
+
+        synthetic_weight = self.params[Product.JAMS]["synthetic_weight"]
+        if abs(position) > self.LIMIT[Product.JAMS] * 0.7:
+            synthetic_weight *= 0.5
+        if abs(position) == self.LIMIT[Product.JAMS]:
+            synthetic_weight = 0
+        return (1 - synthetic_weight) * mid + synthetic_weight * jams_synthetic_mid
 
     def take_orders(
         self,
@@ -744,6 +864,52 @@ class Trader:
                 kelp_take_orders + kelp_clear_orders + kelp_make_orders
             )
 
+        if Product.SQUID_INK in self.params and Product.SQUID_INK in state.order_depths:
+            squid_ink_position = (
+                state.position[Product.SQUID_INK]
+                if Product.SQUID_INK in state.position
+                else 0
+            )
+            squid_ink_fair_value = self.squid_ink_fair_value(
+                state.order_depths[Product.SQUID_INK], traderObject
+            )
+            squid_ink_take_orders, buy_order_volume, sell_order_volume = (
+                self.take_orders(
+                    Product.SQUID_INK,
+                    state.order_depths[Product.SQUID_INK],
+                    squid_ink_fair_value,
+                    self.params[Product.SQUID_INK]["take_width"],
+                    squid_ink_position,
+                    self.params[Product.SQUID_INK]["prevent_adverse"],
+                    self.params[Product.SQUID_INK]["adverse_volume"],
+                )
+            )
+            squid_ink_clear_orders, buy_order_volume, sell_order_volume = (
+                self.clear_orders(
+                    Product.SQUID_INK,
+                    state.order_depths[Product.SQUID_INK],
+                    squid_ink_fair_value,
+                    self.params[Product.SQUID_INK]["clear_width"],
+                    squid_ink_position,
+                    buy_order_volume,
+                    sell_order_volume,
+                )
+            )
+            squid_ink_make_orders, _, _ = self.make_orders(
+                Product.SQUID_INK,
+                state.order_depths[Product.SQUID_INK],
+                squid_ink_fair_value,
+                squid_ink_position,
+                buy_order_volume,
+                sell_order_volume,
+                self.params[Product.SQUID_INK]["disregard_edge"],
+                self.params[Product.SQUID_INK]["join_edge"],
+                self.params[Product.SQUID_INK]["default_edge"],
+            )
+            result[Product.SQUID_INK] = (
+                squid_ink_take_orders + squid_ink_clear_orders + squid_ink_make_orders
+            )
+
         if Product.PICNIC_BASKET1 in self.params and Product.PICNIC_BASKET1 in state.order_depths:
             basket1_position = (
                 state.position[Product.PICNIC_BASKET1]
@@ -835,6 +1001,98 @@ class Trader:
             )
             result[Product.PICNIC_BASKET2] = (
                 basket2_take_orders + basket2_clear_orders + basket2_make_orders
+            )
+
+        if Product.CROISSANTS in self.params and Product.CROISSANTS in state.order_depths:
+            croissants_position = (
+                state.position[Product.CROISSANTS]
+                if Product.CROISSANTS in state.position
+                else 0
+            )
+            croissants_fair_value = self.croissants_fair_value(
+                state.order_depths[Product.CROISSANTS],
+                state.order_depths[Product.PICNIC_BASKET2],
+                state.order_depths[Product.JAMS],
+                croissants_position,
+                traderObject
+            )
+            croissants_take_orders, buy_order_volume, sell_order_volume = self.take_orders(
+                Product.CROISSANTS,
+                state.order_depths[Product.CROISSANTS],
+                croissants_fair_value,
+                self.params[Product.CROISSANTS]["take_width"],
+                croissants_position,
+                self.params[Product.CROISSANTS]["prevent_adverse"],
+                self.params[Product.CROISSANTS]["adverse_volume"],
+            )
+            croissants_clear_orders, buy_order_volume, sell_order_volume = self.clear_orders(
+                Product.CROISSANTS,
+                state.order_depths[Product.CROISSANTS],
+                croissants_fair_value,
+                self.params[Product.CROISSANTS]["clear_width"],
+                croissants_position,
+                buy_order_volume,
+                sell_order_volume,
+            )
+            croissants_make_orders, _, _ = self.make_orders(
+                Product.CROISSANTS,
+                state.order_depths[Product.CROISSANTS],
+                croissants_fair_value,
+                croissants_position,
+                buy_order_volume,
+                sell_order_volume,
+                self.params[Product.CROISSANTS]["disregard_edge"],
+                self.params[Product.CROISSANTS]["join_edge"],
+                self.params[Product.CROISSANTS]["default_edge"],
+            )
+            result[Product.CROISSANTS] = (
+                croissants_take_orders + croissants_clear_orders + croissants_make_orders
+            )
+        
+        if Product.JAMS in self.params and Product.JAMS in state.order_depths:
+            jams_position = (
+                state.position[Product.JAMS]
+                if Product.JAMS in state.position
+                else 0
+            )
+            jams_fair_value = self.jams_fair_value(
+                state.order_depths[Product.JAMS],
+                state.order_depths[Product.PICNIC_BASKET2],
+                state.order_depths[Product.CROISSANTS],
+                jams_position,
+                traderObject
+            )
+            jams_take_orders, buy_order_volume, sell_order_volume = self.take_orders(
+                Product.JAMS,
+                state.order_depths[Product.JAMS],
+                jams_fair_value,
+                self.params[Product.JAMS]["take_width"],
+                jams_position,
+                self.params[Product.JAMS]["prevent_adverse"],
+                self.params[Product.JAMS]["adverse_volume"],
+            )
+            jams_clear_orders, buy_order_volume, sell_order_volume = self.clear_orders(
+                Product.JAMS,
+                state.order_depths[Product.JAMS],
+                jams_fair_value,
+                self.params[Product.JAMS]["clear_width"],
+                jams_position,
+                buy_order_volume,
+                sell_order_volume,
+            )
+            jams_make_orders, _, _ = self.make_orders(
+                Product.JAMS,
+                state.order_depths[Product.JAMS],
+                jams_fair_value,
+                jams_position,
+                buy_order_volume,
+                sell_order_volume,
+                self.params[Product.JAMS]["disregard_edge"],
+                self.params[Product.JAMS]["join_edge"],
+                self.params[Product.JAMS]["default_edge"],
+            )
+            result[Product.JAMS] = (
+                jams_take_orders + jams_clear_orders + jams_make_orders
             )
 
         conversions = 1
