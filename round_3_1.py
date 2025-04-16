@@ -4,16 +4,9 @@ import jsonpickle
 import numpy as np
 import math
 from statistics import NormalDist
-from scipy.optimize import brentq
 
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
-
-# TODO:
-# remove scipy
-# fix squid ink
-# tune basket 2
-# manual
 
 class Logger:
     def __init__(self) -> None:
@@ -128,6 +121,73 @@ class Logger:
 
         return value[: max_length - 3] + "..."
 
+def brentq(f, a, b, tol=1e-10, max_iter=100):
+    fa = f(a)
+    fb = f(b)
+
+    if fa * fb >= 0:
+        raise ValueError("Function must have different signs at endpoints a and b")
+
+    if abs(fa) < abs(fb):
+        a, b = b, a
+        fa, fb = fb, fa
+
+    c = a
+    fc = fa
+    d = e = b - a
+
+    for iteration in range(max_iter):
+        if fb * fc > 0:
+            c = a
+            fc = fa
+            d = e = b - a
+
+        if abs(fc) < abs(fb):
+            a, b, c = b, c, b
+            fa, fb, fc = fb, fc, fb
+
+        tol1 = 2 * tol * abs(b) + 0.5 * tol
+        m = 0.5 * (c - b)
+
+        if abs(m) <= tol1 or fb == 0:
+            return b
+
+        if abs(e) >= tol1 and abs(fa) > abs(fb):
+            s = fb / fa
+            if a == c:
+                # Secant method
+                p = 2 * m * s
+                q = 1 - s
+            else:
+                # Inverse quadratic interpolation
+                q = fa / fc
+                r = fb / fc
+                p = s * (2 * m * q * (q - r) - (b - a) * (r - 1))
+                q = (q - 1) * (r - 1) * (s - 1)
+
+            if p > 0:
+                q = -q
+            p = abs(p)
+
+            if 2 * p < min(3 * m * q - abs(tol1 * q), abs(e * q)):
+                e = d
+                d = p / q
+            else:
+                d = e = m
+        else:
+            d = e = m
+
+        a = b
+        fa = fb
+
+        if abs(d) > tol1:
+            b += d
+        else:
+            b += tol1 if m > 0 else -tol1
+
+        fb = f(b)
+
+    raise RuntimeError("Maximum number of iterations exceeded in brentq")
 
 class Product:
     RAINFOREST_RESIN = "RAINFOREST_RESIN"
@@ -707,7 +767,7 @@ class Trader:
             return estimated_price - call_price
 
         # Using Brent's method to find the root of the equation
-        implied_vol = brentq(equation, 1e-5, 3)
+        implied_vol = brentq(equation, 1e-6, 3)
         return implied_vol
 
     def volcanic_rock_voucher_fair_value(
