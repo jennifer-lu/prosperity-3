@@ -256,8 +256,8 @@ PARAMS = {
     Product.VOLCANIC_ROCK_VOUCHER_9500: {
         "take_width": 1,
         "clear_width": 0,
-        "prevent_adverse": True,
-        "adverse_volume": 15,
+        "prevent_adverse": False,
+        "adverse_volume": 30,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -355,7 +355,7 @@ class Trader:
                     quantity = min(
                         best_ask_amount, position_limit - position
                     )  # max amt to buy
-                    if product == Product.SQUID_INK:
+                    if product == Product.SQUID_INK or Product.VOLCANIC_ROCK_VOUCHER_9500:
                         quantity = position_limit - position
                     if quantity > 0:
                         orders.append(Order(product, best_ask, quantity))
@@ -721,11 +721,14 @@ class Trader:
         if S is None:
             return None
 
-        total_time = 5 / 365
+        total_time = (8 - DAY) / 365
         ticks_per_day = 1_000_000
-        total_ticks = 5 * ticks_per_day
-        T = (total_ticks - timestamp) / total_ticks * total_time
-
+        total_ticks = (8 - DAY) * ticks_per_day
+        T = ((total_ticks - timestamp) / total_ticks) * total_time
+        # total_time = 5 / 365
+        # ticks_per_day = 1_000_000
+        # total_ticks = 5 * ticks_per_day
+        # T = (total_ticks - timestamp) / total_ticks * total_time
         m_list = []
         v_list = []
         voucher_data = {}
@@ -764,18 +767,94 @@ class Trader:
 
             # Step 4: Compute iv_diff and zscore
             iv_diff = data["v_t"] - v_t_fitted
-            iv_diffs = np.array([data["v_t"] - a * data["m_t"]**2 - b * data["m_t"] - c for data in voucher_data.values()])
-            mean_diff = np.mean(iv_diffs)
-            std_diff = np.std(iv_diffs) if np.std(iv_diffs) > 1e-6 else 1.0  # avoid div by 0
-            zscore = (iv_diff - mean_diff) / std_diff
+            # iv_diffs = np.array([data["v_t"] - a * data["m_t"]**2 - b * data["m_t"] - c for data in voucher_data.values()])
+            # mean_diff = np.mean(iv_diffs)
+            # std_diff = np.std(iv_diffs) if np.std(iv_diffs) > 1e-6 else 1.0  # avoid div by 0
+            # zscore = (iv_diff - mean_diff) / std_diff
 
             # Step 5: Set fair to None if abs(zscore) < 1.5
-            if abs(zscore) < 1.5:
-                fairs[product] = None
-            else:
+            if product == Product.VOLCANIC_ROCK_VOUCHER_9500 and abs(iv_diff) > 0.01:
+                # fairs[product] =
                 fairs[product] = fair
+            else:
+                fairs[product] = None
 
         return fairs
+
+    def volcanic_rock_voucher_orders(self, product, orderDepth, position, signal):
+        if signal == 1 and position != -self.LIMIT[product]:
+            target_position = -self.LIMIT[product]
+            if len(orderDepth.buy_orders) > 0:
+                best_bid = max(orderDepth.buy_orders.keys())
+                target_quantity = abs(
+                    target_position - position
+                )
+                quantity = min(
+                    target_quantity,
+                    abs(orderDepth.buy_orders[best_bid]),
+                )
+                quote_quantity = target_quantity - quantity
+                if quote_quantity == 0:
+                    return [Order(product, best_bid, -quantity)], []
+                else:
+                    return [Order(product, best_bid, -quantity)], [
+                        Order(product, best_bid, -quote_quantity)
+                    ]
+        elif signal == -1 and position != self.LIMIT[product]:
+                    target_position = self.LIMIT[product]
+                    if len(orderDepth.sell_orders) > 0:
+                        best_ask = min(orderDepth.sell_orders.keys())
+                        target_quantity = abs(
+                            target_position - position
+                        )
+                        quantity = min(
+                            target_quantity,
+                            abs(orderDepth.sell_orders[best_ask]),
+                        )
+                        quote_quantity = target_quantity - quantity
+                        if quote_quantity == 0:
+                            return [Order(product, best_ask, quantity)], []
+                        else:
+                            return [Order(product, best_ask, quantity)], [
+                                Order(product, best_ask, quote_quantity)
+                            ]
+        elif signal is None and position > 0:
+            target_position = 0
+            if len(orderDepth.buy_orders) > 0:
+                best_bid = max(orderDepth.buy_orders.keys())
+                target_quantity = abs(
+                    target_position - position
+                )
+                quantity = min(
+                    target_quantity,
+                    abs(orderDepth.buy_orders[best_bid]),
+                )
+                quote_quantity = target_quantity - quantity
+                if quote_quantity == 0:
+                    return [Order(product, best_bid, -quantity)], []
+                else:
+                    return [Order(product, best_bid, -quantity)], [
+                        Order(product, best_bid, -quote_quantity)
+                    ]
+        elif signal is None and position < 0:
+            target_position = 0
+            if len(orderDepth.sell_orders) > 0:
+                best_ask = min(orderDepth.sell_orders.keys())
+                target_quantity = abs(
+                    target_position - position
+                )
+                quantity = min(
+                    target_quantity,
+                    abs(orderDepth.sell_orders[best_ask]),
+                )
+                quote_quantity = target_quantity - quantity
+                if quote_quantity == 0:
+                    return [Order(product, best_ask, quantity)], []
+                else:
+                    return [Order(product, best_ask, quantity)], [
+                        Order(product, best_ask, quote_quantity)
+                    ]
+        return None, None
 
     def take_orders(
         self,
@@ -1149,7 +1228,16 @@ class Trader:
 
                     if fair_value is None:
                         continue
-
+                    
+                    # take_orders, make_orders = self.volcanic_rock_voucher_orders(
+                    #     product,
+                    #     order_depth,
+                    #     position,
+                    #     fair_value,
+                    # )
+                    # if take_orders is not None or make_orders is not None:
+                    #     result[product] = take_orders + make_orders
+                    
                     take_orders, buy_volume, sell_volume = self.take_orders(
                         product,
                         order_depth,
@@ -1181,11 +1269,13 @@ class Trader:
                         self.params[product]["join_edge"],
                         self.params[product]["default_edge"],
                     )
-
+                    
                     result[product] = take_orders + clear_orders + make_orders
+
+                
 
         conversions = 1
         traderData = jsonpickle.encode(traderObject)
 
-        # logger.flush(state, result, conversions, traderData)
+        logger.flush(state, result, conversions, traderData)
         return result, conversions, traderData
