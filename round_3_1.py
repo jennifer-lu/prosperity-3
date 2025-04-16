@@ -189,7 +189,7 @@ PARAMS = {
         "join_edge": 0,
         "default_edge": 1,
         "window_size": 20,
-        "deviation_threshold": 0.03,
+        "deviation_threshold": 0.035,
     },
     Product.DJEMBES: {
         "take_width": 2,
@@ -240,7 +240,7 @@ PARAMS = {
         "disregard_edge": 2,
         "join_edge": 0,
         "default_edge": 2,
-        "synthetic_weight": 0.03,
+        "synthetic_weight": 0.04,
         "volatility_window_size": 10,
         "adverse_volatility": 0.1,
     },
@@ -355,7 +355,7 @@ class Trader:
                     quantity = min(
                         best_ask_amount, position_limit - position
                     )  # max amt to buy
-                    if product == Product.SQUID_INK or Product.VOLCANIC_ROCK_VOUCHER_9500:
+                    if product == Product.SQUID_INK:
                         quantity = position_limit - position
                     if quantity > 0:
                         orders.append(Order(product, best_ask, quantity))
@@ -707,28 +707,25 @@ class Trader:
             return estimated_price - call_price
 
         # Using Brent's method to find the root of the equation
-        implied_vol = brentq(equation, -1e-10, 3)
+        implied_vol = brentq(equation, 1e-5, 3)
         return implied_vol
 
     def volcanic_rock_voucher_fair_value(
         self,
         volcanic_rock_order_depth: OrderDepth,
-        volcanic_rock_voucher_order_depths, # Product -> OrderDepth
+        volcanic_rock_voucher_order_depths,  # dict: Product -> OrderDepth
         timestamp: int,
         traderObject,
-    ) -> float:
+    ) -> dict:
         S = self.filtered_mid(Product.VOLCANIC_ROCK, volcanic_rock_order_depth)
         if S is None:
             return None
 
-        total_time = (8 - DAY) / 365
+        total_time = (8 - DAY) / 365  # in years
         ticks_per_day = 1_000_000
         total_ticks = (8 - DAY) * ticks_per_day
         T = ((total_ticks - timestamp) / total_ticks) * total_time
-        # total_time = 5 / 365
-        # ticks_per_day = 1_000_000
-        # total_ticks = 5 * ticks_per_day
-        # T = (total_ticks - timestamp) / total_ticks * total_time
+
         m_list = []
         v_list = []
         voucher_data = {}
@@ -740,16 +737,15 @@ class Trader:
             try:
                 v_t = self.implied_volatility(voucher_mid, S, K, T)
                 m_t = np.log(K / S) / np.sqrt(T)
-                m_list.append(m_t)
-                v_list.append(v_t)
-
                 voucher_data[product] = {
                     "K": K,
                     "mid": voucher_mid,
                     "m_t": m_t,
-                    "v_t": v_t,
+                    "v_t": v_t
                 }
-            except Exception as e:
+                m_list.append(m_t)
+                v_list.append(v_t)
+            except Exception:
                 continue
 
         if len(m_list) < 3:
@@ -758,28 +754,44 @@ class Trader:
         coeffs = np.polyfit(m_list, v_list, deg=2)
         a, b, c = coeffs
 
-        fairs = {}
+        iv_diffs = []
         for product, data in voucher_data.items():
-            m = data["m_t"]
-            v_t_fitted = a * m**2 + b * m + c
-            v_t_fitted = max(v_t_fitted, 0.01)
-            fair = self.black_scholes(S, data["K"], T, r=0, sigma=v_t_fitted)
+            fitted_iv = a * (data["m_t"] ** 2) + b * data["m_t"] + c
+            # Ensure a minimum fitted volatility to avoid division by zero.
+            fitted_iv = max(fitted_iv, 0.01)
+            data["fitted_iv"] = fitted_iv
+            iv_diff = data["v_t"] - fitted_iv
+            data["iv_diff"] = iv_diff
+            iv_diffs.append(iv_diff)
 
-            # Step 4: Compute iv_diff and zscore
-            iv_diff = data["v_t"] - v_t_fitted
-            # iv_diffs = np.array([data["v_t"] - a * data["m_t"]**2 - b * data["m_t"] - c for data in voucher_data.values()])
-            # mean_diff = np.mean(iv_diffs)
-            # std_diff = np.std(iv_diffs) if np.std(iv_diffs) > 1e-6 else 1.0  # avoid div by 0
-            # zscore = (iv_diff - mean_diff) / std_diff
+        if len(iv_diffs) == 0:
+            return None
 
-            # Step 5: Set fair to None if abs(zscore) < 1.5
-            if product == Product.VOLCANIC_ROCK_VOUCHER_9500 and abs(iv_diff) > 0.01:
-                # fairs[product] =
-                fairs[product] = fair
+        mean_diff = np.mean(iv_diffs)
+        std_diff = np.std(iv_diffs) if np.std(iv_diffs) > 1e-6 else 1.0
+
+        zscore_threshold = {
+            "VOLCANIC_ROCK_VOUCHER_9500": 1.5,
+            "VOLCANIC_ROCK_VOUCHER_9750": 1.78,
+            "VOLCANIC_ROCK_VOUCHER_10000": 1.1, # 24328 ,64590, 105312
+            "VOLCANIC_ROCK_VOUCHER_10250": 1.42,
+            "VOLCANIC_ROCK_VOUCHER_10500": 1.5,
+        }
+        signals = {}  # dictionary to return fair value per voucher
+
+        for product, data in voucher_data.items():
+            zscore = (data["iv_diff"] - mean_diff) / std_diff
+            data["zscore"] = zscore
+            if abs(zscore) > zscore_threshold[product]:
+                fitted_iv = data["fitted_iv"]
+                fair = self.black_scholes(S, data["K"], T, r=0, sigma=fitted_iv)
+                signals[product] = fair
             else:
-                fairs[product] = None
+                signals[product] = None
 
-        return fairs
+        traderObject["voucher_debug"] = voucher_data
+
+        return signals
 
     def volcanic_rock_voucher_orders(self, product, orderDepth, position, signal):
         if signal == 1 and position != -self.LIMIT[product]:
@@ -1228,15 +1240,6 @@ class Trader:
 
                     if fair_value is None:
                         continue
-                    
-                    # take_orders, make_orders = self.volcanic_rock_voucher_orders(
-                    #     product,
-                    #     order_depth,
-                    #     position,
-                    #     fair_value,
-                    # )
-                    # if take_orders is not None or make_orders is not None:
-                    #     result[product] = take_orders + make_orders
                     
                     take_orders, buy_volume, sell_volume = self.take_orders(
                         product,
