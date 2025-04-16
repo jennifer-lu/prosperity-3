@@ -4,9 +4,16 @@ import jsonpickle
 import numpy as np
 import math
 from statistics import NormalDist
+from scipy.optimize import brentq
 
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
+
+# TODO:
+# remove scipy
+# fix squid ink
+# tune basket 2
+# manual
 
 class Logger:
     def __init__(self) -> None:
@@ -149,7 +156,7 @@ BASKET2_WEIGHTS = {
     Product.JAMS: 2,
 }
 
-ROUND = 0
+DAY = 0
 
 PARAMS = {
     Product.RAINFOREST_RESIN: {
@@ -238,27 +245,68 @@ PARAMS = {
         "adverse_volatility": 0.1,
     },
     Product.VOLCANIC_ROCK: {
+        "take_width": 1,
+        "clear_width": 0,
+        "prevent_adverse": True,
+        "adverse_volume": 15,
+        "disregard_edge": 1,
+        "join_edge": 0,
+        "default_edge": 1,
     },
     Product.VOLCANIC_ROCK_VOUCHER_9500: {
-        "strike": 9500,
+        "take_width": 1,
+        "clear_width": 0,
+        "prevent_adverse": True,
+        "adverse_volume": 15,
+        "disregard_edge": 1,
+        "join_edge": 0,
+        "default_edge": 1,
     },
     Product.VOLCANIC_ROCK_VOUCHER_9750: {
-        "strike": 9750,
+        "take_width": 1,
+        "clear_width": 0,
+        "prevent_adverse": True,
+        "adverse_volume": 15,
+        "disregard_edge": 1,
+        "join_edge": 0,
+        "default_edge": 1,
     },
     Product.VOLCANIC_ROCK_VOUCHER_10000: {
-        "strike": 10000,
+        "take_width": 1,
+        "clear_width": 0,
+        "prevent_adverse": True,
+        "adverse_volume": 15,
+        "disregard_edge": 1,
+        "join_edge": 0,
+        "default_edge": 1,
     },
     Product.VOLCANIC_ROCK_VOUCHER_10250: {
-        "strike": 10250,
+        "take_width": 1,
+        "clear_width": 0,
+        "prevent_adverse": True,
+        "adverse_volume": 15,
+        "disregard_edge": 1,
+        "join_edge": 0,
+        "default_edge": 1,
     },
     Product.VOLCANIC_ROCK_VOUCHER_10500: {
-        "strike": 10500,
+        "take_width": 1,
+        "clear_width": 0,
+        "prevent_adverse": True,
+        "adverse_volume": 15,
+        "disregard_edge": 1,
+        "join_edge": 0,
+        "default_edge": 1,
     },
 }
 
-#  The TTE of the vouchers linearly decay by every timestamp. It starts at 8 days at day 0.csv initial timestamp and decays down to 7 days at day 0.csv end timestamp, and continues in this linear fashion for each day. So there shouldn't be any jump on TTE at the round transition.
-
-
+VOLCANIC_ROCK_VOUCHER_STRIKE = {
+    Product.VOLCANIC_ROCK_VOUCHER_9500: 9500,
+    Product.VOLCANIC_ROCK_VOUCHER_9750: 9750,
+    Product.VOLCANIC_ROCK_VOUCHER_10000: 10000,
+    Product.VOLCANIC_ROCK_VOUCHER_10250: 10250,
+    Product.VOLCANIC_ROCK_VOUCHER_10500: 10500,
+}
 
 class Trader:
     def __init__(self, params=None):
@@ -646,40 +694,88 @@ class Trader:
             synthetic_weight *= decay_factor
         return (1 - synthetic_weight) * mid + synthetic_weight * basket2_synthetic_mid
 
-    def black_scholes(S, K, T, r, sigma):
+    def black_scholes(self, S, K, T, r, sigma):
         N = NormalDist().cdf
         d1 = (math.log(S / K) + (r + sigma ** 2 / 2) * T) / (sigma * math.sqrt(T))
         d2 = d1 - sigma * math.sqrt(T)
         return S * N(d1) - K * math.exp(-r * T) * N(d2)
+    
+    def implied_volatility(self, call_price, spot, strike, time_to_expiry):
+        # Define the equation where the root is the implied volatility
+        def equation(volatility):
+            estimated_price = self.black_scholes(spot, strike, time_to_expiry, 0, volatility)
+            return estimated_price - call_price
 
-    def volcanic_rock_voucher_9500_fair_value(
+        # Using Brent's method to find the root of the equation
+        implied_vol = brentq(equation, -1e-10, 3)
+        return implied_vol
+
+    def volcanic_rock_voucher_fair_value(
         self,
-        order_depth: OrderDepth,
         volcanic_rock_order_depth: OrderDepth,
-        tradingState: TradingState,
+        volcanic_rock_voucher_order_depths, # Product -> OrderDepth
+        timestamp: int,
         traderObject,
     ) -> float:
-        mid = self.filtered_mid(Product.VOLCANIC_ROCK_VOUCHER_9500, order_depth)
-        volcanic_rock_mid = self.filtered_mid(Product.VOLCANIC_ROCK, volcanic_rock_order_depth)
-
-        if mid is None or volcanic_rock_mid is None:
+        S = self.filtered_mid(Product.VOLCANIC_ROCK, volcanic_rock_order_depth)
+        if S is None:
             return None
-        
-        S = volcanic_rock_mid
-        K = self.params[Product.VOLCANIC_ROCK_VOUCHER_9500]["strike"]
-        T = 5 / 365
-        # total_time = 5 / 365  # in years
-        # ticks_per_day = 1_000_000
-        # total_ticks = 5 * ticks_per_day
-        # (total_ticks - tradingState.timestamp) / total_ticks * total_time
-        # T = (total_ticks - tradingState.timestamp) / total_ticks * total_time
-        r = 0
-        sigma = 0.194962
-        # volatility = rock_data['log_return'].std() * np.sqrt(1_000_000)  # Annualize from per-tick std
 
-        fair = self.black_scholes(S, K, T, r, sigma)
+        total_time = 5 / 365
+        ticks_per_day = 1_000_000
+        total_ticks = 5 * ticks_per_day
+        T = (total_ticks - timestamp) / total_ticks * total_time
 
-        return fair
+        m_list = []
+        v_list = []
+        voucher_data = {}
+
+        for product, K in VOLCANIC_ROCK_VOUCHER_STRIKE.items():
+            voucher_mid = self.filtered_mid(product, volcanic_rock_voucher_order_depths[product])
+            if voucher_mid is None:
+                continue
+            try:
+                v_t = self.implied_volatility(voucher_mid, S, K, T)
+                m_t = np.log(K / S) / np.sqrt(T)
+                m_list.append(m_t)
+                v_list.append(v_t)
+
+                voucher_data[product] = {
+                    "K": K,
+                    "mid": voucher_mid,
+                    "m_t": m_t,
+                    "v_t": v_t,
+                }
+            except Exception as e:
+                continue
+
+        if len(m_list) < 3:
+            return None
+
+        coeffs = np.polyfit(m_list, v_list, deg=2)
+        a, b, c = coeffs
+
+        fairs = {}
+        for product, data in voucher_data.items():
+            m = data["m_t"]
+            v_t_fitted = a * m**2 + b * m + c
+            v_t_fitted = max(v_t_fitted, 0.01)
+            fair = self.black_scholes(S, data["K"], T, r=0, sigma=v_t_fitted)
+
+            # Step 4: Compute iv_diff and zscore
+            iv_diff = data["v_t"] - v_t_fitted
+            iv_diffs = np.array([data["v_t"] - a * data["m_t"]**2 - b * data["m_t"] - c for data in voucher_data.values()])
+            mean_diff = np.mean(iv_diffs)
+            std_diff = np.std(iv_diffs) if np.std(iv_diffs) > 1e-6 else 1.0  # avoid div by 0
+            zscore = (iv_diff - mean_diff) / std_diff
+
+            # Step 5: Set fair to None if abs(zscore) < 1.5
+            if abs(zscore) < 1.5:
+                fairs[product] = None
+            else:
+                fairs[product] = fair
+
+        return fairs
 
     def take_orders(
         self,
@@ -1028,8 +1124,68 @@ class Trader:
                 basket2_take_orders + basket2_clear_orders + basket2_make_orders
             )
 
+        volcanic_rock_voucher_products = [
+            Product.VOLCANIC_ROCK_VOUCHER_9500,
+            Product.VOLCANIC_ROCK_VOUCHER_9750,
+            Product.VOLCANIC_ROCK_VOUCHER_10000,
+            Product.VOLCANIC_ROCK_VOUCHER_10250,
+            Product.VOLCANIC_ROCK_VOUCHER_10500,
+        ]
+
+        if Product.VOLCANIC_ROCK in state.order_depths and all(p in state.order_depths for p in volcanic_rock_voucher_products):
+            voucher_order_depths = {p: state.order_depths[p] for p in volcanic_rock_voucher_products}
+            fair_values = self.volcanic_rock_voucher_fair_value(
+                state.order_depths[Product.VOLCANIC_ROCK],
+                voucher_order_depths,
+                state.timestamp,
+                traderObject
+            )
+
+            if fair_values is not None:
+                for product in volcanic_rock_voucher_products:
+                    order_depth = state.order_depths[product]
+                    position = state.position.get(product, 0)
+                    fair_value = fair_values.get(product)
+
+                    if fair_value is None:
+                        continue
+
+                    take_orders, buy_volume, sell_volume = self.take_orders(
+                        product,
+                        order_depth,
+                        fair_value,
+                        self.params[product]["take_width"],
+                        position,
+                        self.params[product]["prevent_adverse"],
+                        self.params[product]["adverse_volume"],
+                    )
+
+                    clear_orders, buy_volume, sell_volume = self.clear_orders(
+                        product,
+                        order_depth,
+                        fair_value,
+                        self.params[product]["clear_width"],
+                        position,
+                        buy_volume,
+                        sell_volume,
+                    )
+
+                    make_orders, _, _ = self.make_orders(
+                        product,
+                        order_depth,
+                        fair_value,
+                        position,
+                        buy_volume,
+                        sell_volume,
+                        self.params[product]["disregard_edge"],
+                        self.params[product]["join_edge"],
+                        self.params[product]["default_edge"],
+                    )
+
+                    result[product] = take_orders + clear_orders + make_orders
+
         conversions = 1
         traderData = jsonpickle.encode(traderObject)
 
-        logger.flush(state, result, conversions, traderData)
+        # logger.flush(state, result, conversions, traderData)
         return result, conversions, traderData
