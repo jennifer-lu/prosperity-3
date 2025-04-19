@@ -318,8 +318,8 @@ PARAMS = {
     Product.VOLCANIC_ROCK_VOUCHER_9500: {
         "take_width": 1,
         "clear_width": 0,
-        "prevent_adverse": False,
-        "adverse_volume": 30,
+        "prevent_adverse": True,
+        "adverse_volume": 5,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -328,7 +328,7 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
+        "adverse_volume": 5,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -337,7 +337,7 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
+        "adverse_volume": 5,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -346,7 +346,7 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
+        "adverse_volume": 5,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -355,16 +355,16 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
+        "adverse_volume": 5,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
     },
     Product.MAGNIFICENT_MACARONS: {
-        "make_edge": 1,
+        "make_edge": 2,
         "make_min_edge": 1,
         "make_probability": 0.6,
-        "init_make_edge": 1,
+        "init_make_edge": 2,
         "min_edge": 0.5,
         "volume_avg_timestamp": 5,
         "volume_bar": 75,
@@ -373,7 +373,7 @@ PARAMS = {
         "take_width": 2,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
+        "adverse_volume": 10,
         "disregard_edge": 2,
         "join_edge": 0,
         "default_edge": 2,
@@ -956,59 +956,51 @@ class Trader:
                     ]
         return None, None
     
-    def macarons_fair_value(self, order_depth: OrderDepth, observation: ConversionObservation, position, traderObject) -> float:
-        features = [
-            observation.sugarPrice,
-            observation.sunlightIndex,
-            observation.transportFees,
-            observation.exportTariff,
-            observation.importTariff
-        ]
+    def macarons_fair_value(self, order_depth, observation, position, traderObject) -> float:
+        CSI = 58
+        sunlight_window = 5
         mid = self.filtered_mid(Product.MAGNIFICENT_MACARONS, order_depth)
 
-        # Initialize history if missing
         if "macarons_feature_history" not in traderObject:
             traderObject["macarons_feature_history"] = []
-            traderObject["macarons_mid_history"] = []
+        traderObject["macarons_feature_history"].append({
+            "sugarPrice": observation.sugarPrice,
+            "sunlightIndex": observation.sunlightIndex,
+        })
+        history = traderObject["macarons_feature_history"][-sunlight_window:]
+        traderObject["macarons_feature_history"] = history
 
-        # Update history
-        traderObject["macarons_feature_history"].append(features)
-        traderObject["macarons_mid_history"].append(mid)
+        if position == self.LIMIT[Product.MAGNIFICENT_MACARONS]:
+            return max(order_depth.buy_orders.keys())
+        if position == -1 * self.LIMIT[Product.MAGNIFICENT_MACARONS]:
+            return min(order_depth.sell_orders.keys())
 
-        # Trim to window size
-        window_size = self.params[Product.MAGNIFICENT_MACARONS]["window_size"]
-        traderObject["macarons_feature_history"] = traderObject["macarons_feature_history"][-window_size:]
-        traderObject["macarons_mid_history"] = traderObject["macarons_mid_history"][-window_size:]
-
-        if len(traderObject["macarons_mid_history"]) < window_size:
+        if observation.sunlightIndex > CSI:
             return None
 
-        # Build training data
-        X = np.array(traderObject["macarons_feature_history"])
-        y = np.array(traderObject["macarons_mid_history"])
-        X_with_intercept = np.hstack([np.ones((window_size, 1)), X])
-        current_features_with_intercept = np.array([1] + features)
+        if len(history) >= sunlight_window:
+            sunlight_now = history[-1]["sunlightIndex"]
+            sunlight_past = history[-sunlight_window]["sunlightIndex"]
+            sunlight_delta = sunlight_now - sunlight_past
 
-        # Perform regression
-        try:
-            beta = np.linalg.pinv(X_with_intercept) @ y
-            raw_fair = current_features_with_intercept @ beta
-        except np.linalg.LinAlgError:
-            return None
-        
-        deviation_threshold = self.params[Product.MAGNIFICENT_MACARONS]["deviation_threshold"]
-        if abs(raw_fair - mid) / mid > deviation_threshold:
-            return mid
-        
-        model_weight = self.params[Product.MAGNIFICENT_MACARONS]["model_weight"]
-        weighted_raw_fair = (1 - model_weight) * mid + model_weight * raw_fair
-        
-        storage_cost = 0.1 * max(0, position)
-        adjusted_fair = weighted_raw_fair - storage_cost
+            if sunlight_delta < 0:
+                best_ask = min(order_depth.sell_orders.keys())
+                filtered_asks = [
+                    price for price in order_depth.sell_orders.keys()
+                    if abs(order_depth.sell_orders[price]) >= self.params[Product.MAGNIFICENT_MACARONS]["adverse_volume"]
+                ]
+                best_filtered_ask = min(filtered_asks) if filtered_asks else best_ask
+                return best_filtered_ask + 1
+            elif sunlight_delta > 0:
+                best_bid = max(order_depth.buy_orders.keys())
+                filtered_bids = [
+                    price for price in order_depth.buy_orders.keys()
+                    if abs(order_depth.buy_orders[price]) >= self.params[Product.MAGNIFICENT_MACARONS]["adverse_volume"]
+                ]
+                best_filtered_bid = max(filtered_bids) if filtered_bids else best_bid
+                return best_filtered_bid - 1
 
-        # print(mid, raw_fair, storage_cost, adjusted_fair)
-
-        return adjusted_fair
+        return mid
     
     def macarons_implied_bid_ask(self, observation):
         implied_bid = observation.bidPrice - observation.exportTariff - observation.transportFees
@@ -1545,50 +1537,58 @@ class Trader:
                     
                     result[product] = take_orders + clear_orders + make_orders
 
+        conversions = 0
         if Product.MAGNIFICENT_MACARONS in self.params \
         and Product.MAGNIFICENT_MACARONS in state.order_depths \
         and Product.MAGNIFICENT_MACARONS in state.observations.conversionObservations:
-            if "macarons" not in traderObject:
-                traderObject["macarons"] = {"curr_edge": self.params[Product.MAGNIFICENT_MACARONS]["init_make_edge"], "volume_history": [], "optimized": False}
-            
             macarons_position = (
                 state.position[Product.MAGNIFICENT_MACARONS]
                 if Product.MAGNIFICENT_MACARONS in state.position
                 else 0
             )
-            
-            conversions = self.macarons_arb_clear(
-                macarons_position
-            )
-
-            macarons_position = 0
-
-            adap_edge = self.macarons_adap_edge(
-                state.timestamp,
-                traderObject["macarons"]["curr_edge"],
-                macarons_position,
-                traderObject,
-            )
-
-            macarons_take_orders, buy_order_volume, sell_order_volume = self.macarons_arb_take(
-                state.order_depths[Product.MAGNIFICENT_MACARONS],
-                state.observations.conversionObservations[Product.MAGNIFICENT_MACARONS],
-                adap_edge,
-                macarons_position,
-            )
-
-            macarons_make_orders, _, _ = self.macarons_arb_make(
+            macarons_fair_value = self.macarons_fair_value(
                 state.order_depths[Product.MAGNIFICENT_MACARONS],
                 state.observations.conversionObservations[Product.MAGNIFICENT_MACARONS],
                 macarons_position,
-                adap_edge,
-                buy_order_volume,
-                sell_order_volume
+                traderObject
             )
-
-            result[Product.MAGNIFICENT_MACARONS] = (
-                macarons_take_orders + macarons_make_orders
-            )
+            if macarons_fair_value is not None:
+                macarons_take_orders, buy_order_volume, sell_order_volume = (
+                    self.take_orders(
+                        Product.MAGNIFICENT_MACARONS,
+                        state.order_depths[Product.MAGNIFICENT_MACARONS],
+                        macarons_fair_value,
+                        self.params[Product.MAGNIFICENT_MACARONS]["take_width"],
+                        macarons_position,
+                        self.params[Product.MAGNIFICENT_MACARONS]["prevent_adverse"],
+                        self.params[Product.MAGNIFICENT_MACARONS]["adverse_volume"],
+                    )
+                )
+                macarons_clear_orders, buy_order_volume, sell_order_volume = (
+                    self.clear_orders(
+                        Product.MAGNIFICENT_MACARONS,
+                        state.order_depths[Product.MAGNIFICENT_MACARONS],
+                        macarons_fair_value,
+                        self.params[Product.MAGNIFICENT_MACARONS]["clear_width"],
+                        macarons_position,
+                        buy_order_volume,
+                        sell_order_volume,
+                    )
+                )
+                macarons_make_orders, _, _ = self.make_orders(
+                    Product.MAGNIFICENT_MACARONS,
+                    state.order_depths[Product.MAGNIFICENT_MACARONS],
+                    macarons_fair_value,
+                    macarons_position,
+                    buy_order_volume,
+                    sell_order_volume,
+                    self.params[Product.MAGNIFICENT_MACARONS]["disregard_edge"],
+                    self.params[Product.MAGNIFICENT_MACARONS]["join_edge"],
+                    self.params[Product.MAGNIFICENT_MACARONS]["default_edge"],
+                )
+                result[Product.MAGNIFICENT_MACARONS] = (
+                    macarons_take_orders + macarons_clear_orders + macarons_make_orders
+                )
 
         traderData = jsonpickle.encode(traderObject)
 
