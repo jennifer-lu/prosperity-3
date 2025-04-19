@@ -318,8 +318,8 @@ PARAMS = {
     Product.VOLCANIC_ROCK_VOUCHER_9500: {
         "take_width": 1,
         "clear_width": 0,
-        "prevent_adverse": True,
-        "adverse_volume": 5,
+        "prevent_adverse": False,
+        "adverse_volume": 30,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -346,7 +346,7 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 5,
+        "adverse_volume": 17,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -860,9 +860,9 @@ class Trader:
 
         zscore_threshold = {
             "VOLCANIC_ROCK_VOUCHER_9500": 1.5,
-            "VOLCANIC_ROCK_VOUCHER_9750": 1.78,
+            "VOLCANIC_ROCK_VOUCHER_9750": 1.45,
             "VOLCANIC_ROCK_VOUCHER_10000": 1.1, # 24328 ,64590, 105312
-            "VOLCANIC_ROCK_VOUCHER_10250": 1.42,
+            "VOLCANIC_ROCK_VOUCHER_10250": 1.43,
             "VOLCANIC_ROCK_VOUCHER_10500": 1.5,
         }
         signals = {}  # dictionary to return fair value per voucher
