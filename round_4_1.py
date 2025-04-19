@@ -361,15 +361,25 @@ PARAMS = {
         "default_edge": 1,
     },
     Product.MAGNIFICENT_MACARONS: {
-        "take_width": 1,
+        "make_edge": 1,
+        "make_min_edge": 1,
+        "make_probability": 0.6,
+        "init_make_edge": 1,
+        "min_edge": 0.5,
+        "volume_avg_timestamp": 5,
+        "volume_bar": 75,
+        "dec_edge_discount": 0.8,
+        "step_size": 0.5,
+        "take_width": 2,
         "clear_width": 0,
         "prevent_adverse": True,
         "adverse_volume": 15,
-        "disregard_edge": 1,
+        "disregard_edge": 2,
         "join_edge": 0,
-        "default_edge": 1,
+        "default_edge": 2,
         "window_size": 50,
         "deviation_threshold": 0.05,
+        "model_weight": 0.02,
     },
 }
 
@@ -988,10 +998,15 @@ class Trader:
         
         deviation_threshold = self.params[Product.MAGNIFICENT_MACARONS]["deviation_threshold"]
         if abs(raw_fair - mid) / mid > deviation_threshold:
-            return None
+            return mid
+        
+        model_weight = self.params[Product.MAGNIFICENT_MACARONS]["model_weight"]
+        weighted_raw_fair = (1 - model_weight) * mid + model_weight * raw_fair
         
         storage_cost = 0.1 * max(0, position)
-        adjusted_fair = raw_fair - storage_cost
+        adjusted_fair = weighted_raw_fair - storage_cost
+
+        # print(mid, raw_fair, storage_cost, adjusted_fair)
 
         return adjusted_fair
     
@@ -1000,10 +1015,52 @@ class Trader:
         implied_ask = observation.askPrice + observation.importTariff + observation.transportFees
         return implied_bid, implied_ask
     
+    def macarons_adap_edge(
+        self,
+        timestamp: int,
+        curr_edge: float,
+        position: int,
+        traderObject: dict
+    ) -> float: 
+        if timestamp == 0:
+            traderObject["macarons"]["curr_edge"] = self.params[Product.MAGNIFICENT_MACARONS]["init_make_edge"]
+            return self.params[Product.MAGNIFICENT_MACARONS]["init_make_edge"]
+
+        # Timestamp not 0
+        traderObject["macarons"]["volume_history"].append(abs(position))
+        if len(traderObject["macarons"]["volume_history"]) > self.params[Product.MAGNIFICENT_MACARONS]["volume_avg_timestamp"]:
+            traderObject["macarons"]["volume_history"].pop(0)
+
+        if len(traderObject["macarons"]["volume_history"]) < self.params[Product.MAGNIFICENT_MACARONS]["volume_avg_timestamp"]:
+            return curr_edge
+        elif not traderObject["macarons"]["optimized"]:
+            volume_avg = np.mean(traderObject["macarons"]["volume_history"])
+
+            # Bump up edge if consistently getting lifted full size
+            if volume_avg >= self.params[Product.MAGNIFICENT_MACARONS]["volume_bar"]:
+                traderObject["macarons"]["volume_history"] = [] # clear volume history if edge changed
+                traderObject["macarons"]["curr_edge"] = curr_edge + self.params[Product.MAGNIFICENT_MACARONS]["step_size"]
+                return curr_edge + self.params[Product.MAGNIFICENT_MACARONS]["step_size"]
+
+            # Decrement edge if more cash with less edge, included discount
+            elif self.params[Product.MAGNIFICENT_MACARONS]["dec_edge_discount"] * self.params[Product.MAGNIFICENT_MACARONS]["volume_bar"] * (curr_edge - self.params[Product.MAGNIFICENT_MACARONS]["step_size"]) > volume_avg * curr_edge:
+                if curr_edge - self.params[Product.MAGNIFICENT_MACARONS]["step_size"] > self.params[Product.MAGNIFICENT_MACARONS]["min_edge"]:
+                    traderObject["macarons"]["volume_history"] = [] # clear volume history if edge changed
+                    traderObject["macarons"]["curr_edge"] = curr_edge - self.params[Product.MAGNIFICENT_MACARONS]["step_size"]
+                    traderObject["macarons"]["optimized"] = True
+                    return curr_edge - self.params[Product.MAGNIFICENT_MACARONS]["step_size"]
+                else:
+                    traderObject["macarons"]["curr_edge"] = self.params[Product.MAGNIFICENT_MACARONS]["min_edge"]
+                    return self.params[Product.MAGNIFICENT_MACARONS]["min_edge"]
+
+        traderObject["macarons"]["curr_edge"] = curr_edge
+        return curr_edge
+    
     def macarons_arb_take(
         self,
         order_depth: OrderDepth,
         observation: ConversionObservation,
+        adap_edge: float,
         position: int,
     ):
         orders: List[Order] = []
@@ -1015,10 +1072,12 @@ class Trader:
         buy_quantity = position_limit - position
         sell_quantity = position_limit + position
 
-        edge = 0.5  # tunable param
+        ask = implied_ask + adap_edge
+        
+        edge = (ask - implied_ask) * self.params[Product.MAGNIFICENT_MACARONS]["make_probability"]
 
         for price in sorted(order_depth.sell_orders.keys()):
-            if price > implied_bid - 0.1 - edge:
+            if price > implied_bid - edge:
                 break
             quantity = min(abs(order_depth.sell_orders[price]), buy_quantity)
             if quantity > 0:
@@ -1037,8 +1096,10 @@ class Trader:
 
     def macarons_arb_make(
         self,
+        order_depth: OrderDepth,
         observation: ConversionObservation,
         position: int,
+        adap_edge: float,
         buy_order_volume: int,
         sell_order_volume: int,
     ):
@@ -1046,11 +1107,23 @@ class Trader:
         position_limit = self.LIMIT[Product.MAGNIFICENT_MACARONS]
 
         implied_bid, implied_ask = self.macarons_implied_bid_ask(observation)
-        aggressive_ask = round(observation.askPrice) - 2
-        aggressive_bid = round(observation.bidPrice) + 2
 
-        bid = min(aggressive_bid, implied_bid - 1.1)
-        ask = max(aggressive_ask, implied_ask + 1.5)
+        bid = implied_bid - adap_edge
+        ask = implied_ask + adap_edge
+
+        filtered_ask = [price for price in order_depth.sell_orders.keys() if abs(order_depth.sell_orders[price]) >= 40]
+        filtered_bid = [price for price in order_depth.buy_orders.keys() if abs(order_depth.buy_orders[price]) >= 25]
+
+        if len(filtered_ask) > 0 and ask > filtered_ask[0]:
+            if filtered_ask[0] - 1 > implied_ask:
+                ask = filtered_ask[0] - 1
+            else:
+                ask = implied_ask + adap_edge
+        if len(filtered_bid) > 0 and bid < filtered_bid[0]:
+            if filtered_bid[0] + 1 < implied_bid:
+                bid = filtered_bid[0] + 1
+            else:
+                bid = implied_bid - adap_edge
 
         buy_quantity = position_limit - (position + buy_order_volume)
         if buy_quantity > 0:
@@ -1472,56 +1545,50 @@ class Trader:
                     
                     result[product] = take_orders + clear_orders + make_orders
 
-        conversions = 0
-
         if Product.MAGNIFICENT_MACARONS in self.params \
         and Product.MAGNIFICENT_MACARONS in state.order_depths \
         and Product.MAGNIFICENT_MACARONS in state.observations.conversionObservations:
+            if "macarons" not in traderObject:
+                traderObject["macarons"] = {"curr_edge": self.params[Product.MAGNIFICENT_MACARONS]["init_make_edge"], "volume_history": [], "optimized": False}
+            
             macarons_position = (
                 state.position[Product.MAGNIFICENT_MACARONS]
                 if Product.MAGNIFICENT_MACARONS in state.position
                 else 0
             )
-            macarons_fair_value = self.macarons_fair_value(
+            
+            conversions = self.macarons_arb_clear(
+                macarons_position
+            )
+
+            macarons_position = 0
+
+            adap_edge = self.macarons_adap_edge(
+                state.timestamp,
+                traderObject["macarons"]["curr_edge"],
+                macarons_position,
+                traderObject,
+            )
+
+            macarons_take_orders, buy_order_volume, sell_order_volume = self.macarons_arb_take(
+                state.order_depths[Product.MAGNIFICENT_MACARONS],
+                state.observations.conversionObservations[Product.MAGNIFICENT_MACARONS],
+                adap_edge,
+                macarons_position,
+            )
+
+            macarons_make_orders, _, _ = self.macarons_arb_make(
                 state.order_depths[Product.MAGNIFICENT_MACARONS],
                 state.observations.conversionObservations[Product.MAGNIFICENT_MACARONS],
                 macarons_position,
-                traderObject
+                adap_edge,
+                buy_order_volume,
+                sell_order_volume
             )
-            macarons_implied_bid, macarons_implied_ask = self.macarons_implied_bid_ask(
-                state.observations.conversionObservations[Product.MAGNIFICENT_MACARONS]
+
+            result[Product.MAGNIFICENT_MACARONS] = (
+                macarons_take_orders + macarons_make_orders
             )
-            
-            if macarons_fair_value is not None:
-                if macarons_fair_value > macarons_implied_ask:
-                    target_position = self.LIMIT[Product.MAGNIFICENT_MACARONS]
-                elif macarons_fair_value < macarons_implied_bid:
-                    target_position = -self.LIMIT[Product.MAGNIFICENT_MACARONS]
-                else:
-                    target_position = 0
-
-                take_orders, buy_order_volume, sell_order_volume = self.macarons_arb_take(
-                    state.order_depths[Product.MAGNIFICENT_MACARONS],
-                    state.observations.conversionObservations[Product.MAGNIFICENT_MACARONS],
-                    0,
-                )
-                
-                make_orders, _, _ = self.macarons_arb_make(
-                    state.observations.conversionObservations[Product.MAGNIFICENT_MACARONS],
-                    0,
-                    buy_order_volume,
-                    sell_order_volume,
-                )
-
-                if len(make_orders) > 0:
-                    conversions = self.macarons_arb_clear(macarons_position)
-                    result[Product.MAGNIFICENT_MACARONS] = take_orders + make_orders
-                else:
-                    position_diff = target_position - macarons_position
-                    if position_diff > 0:
-                        conversions = position_diff
-                    elif position_diff < 0:
-                        conversions = position_diff
 
         traderData = jsonpickle.encode(traderObject)
 
