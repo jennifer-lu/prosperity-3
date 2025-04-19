@@ -216,7 +216,7 @@ BASKET2_WEIGHTS = {
     Product.JAMS: 2,
 }
 
-DAY = 0
+DAY = 4
 
 PARAMS = {
     Product.RAINFOREST_RESIN: {
@@ -326,7 +326,7 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
+        "adverse_volume": 5,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -335,7 +335,7 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
+        "adverse_volume": 5,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -344,7 +344,7 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
+        "adverse_volume": 17,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -353,7 +353,7 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": True,
-        "adverse_volume": 15,
+        "adverse_volume": 5,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -834,7 +834,7 @@ class Trader:
             "VOLCANIC_ROCK_VOUCHER_9500": 1.5,
             "VOLCANIC_ROCK_VOUCHER_9750": 1.78,
             "VOLCANIC_ROCK_VOUCHER_10000": 1.1, # 24328 ,64590, 105312
-            "VOLCANIC_ROCK_VOUCHER_10250": 1.42,
+            "VOLCANIC_ROCK_VOUCHER_10250": 1.43,
             "VOLCANIC_ROCK_VOUCHER_10500": 1.5,
         }
         signals = {}  # dictionary to return fair value per voucher
