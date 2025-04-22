@@ -1,12 +1,15 @@
-from typing import Any, List
+from typing import Any, List, TypeAlias
 import json
 import jsonpickle
 import numpy as np
 import math
 from statistics import NormalDist
+from abc import abstractmethod
+from enum import IntEnum
 
-from datamodel import ConversionObservation, Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
+from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
+JSON: TypeAlias = dict[str, "JSON"] | list["JSON"] | str | int | float | bool | None
 
 class Logger:
     def __init__(self) -> None:
@@ -319,7 +322,7 @@ PARAMS = {
         "take_width": 1,
         "clear_width": 0,
         "prevent_adverse": False,
-        "adverse_volume": 30,
+        "adverse_volume": 5,
         "disregard_edge": 1,
         "join_edge": 0,
         "default_edge": 1,
@@ -390,6 +393,241 @@ VOLCANIC_ROCK_VOUCHER_STRIKE = {
     Product.VOLCANIC_ROCK_VOUCHER_10250: 10250,
     Product.VOLCANIC_ROCK_VOUCHER_10500: 10500,
 }
+
+class Strategy:
+    def __init__(self, symbol: str, limit: int) -> None:
+        self.symbol = symbol
+        self.limit = limit
+
+    @abstractmethod
+    def act(self, state: TradingState) -> None:
+        raise NotImplementedError()
+
+    def run(self, state: TradingState, traderObject) -> tuple[list[Order], int]:
+        self.orders = []
+        self.conversions = 0
+
+        self.act(state, traderObject)
+
+        return self.orders, self.conversions
+
+    def buy(self, price: int, quantity: int) -> None:
+        self.orders.append(Order(self.symbol, price, quantity))
+
+    def sell(self, price: int, quantity: int) -> None:
+        self.orders.append(Order(self.symbol, price, -quantity))
+
+    def convert(self, amount: int) -> None:
+        self.conversions += amount
+
+    def get_mid_price(self, state: TradingState, symbol: str) -> float:
+        order_depth = state.order_depths[symbol]
+        buy_orders = sorted(order_depth.buy_orders.items(), reverse=True)
+        sell_orders = sorted(order_depth.sell_orders.items())
+
+        popular_buy_price = max(buy_orders, key=lambda tup: tup[1])[0]
+        popular_sell_price = min(sell_orders, key=lambda tup: tup[1])[0]
+
+        return (popular_buy_price + popular_sell_price) / 2
+    
+    def filtered_mid(
+        self,
+        product: str,
+        order_depth: OrderDepth,
+        adverse_volume: int
+    ) -> float:
+        if not order_depth.sell_orders or not order_depth.buy_orders:
+            return None
+
+        best_ask = min(order_depth.sell_orders.keys())
+        best_bid = max(order_depth.buy_orders.keys())
+        filtered_asks = [
+            price for price in order_depth.sell_orders.keys()
+            if abs(order_depth.sell_orders[price]) >= adverse_volume
+        ]
+        filtered_bids = [
+            price for price in order_depth.buy_orders.keys()
+            if abs(order_depth.buy_orders[price]) >= adverse_volume
+        ]
+        best_filtered_ask = min(filtered_asks) if filtered_asks else None
+        best_filtered_bid = max(filtered_bids) if filtered_bids else None
+
+        if best_filtered_ask is not None and best_filtered_bid is not None:
+            return (best_filtered_ask + best_filtered_bid) / 2
+        return (best_ask + best_bid) / 2
+
+    def save(self) -> JSON:
+        return None
+
+    def load(self, data: JSON) -> None:
+        pass
+
+class Signal(IntEnum):
+    NEUTRAL = 0
+    SHORT = 1
+    LONG = 2
+
+class SignalStrategy(Strategy):
+    def __init__(self, symbol: Symbol, limit: int) -> None:
+        super().__init__(symbol, limit)
+
+    @abstractmethod
+    def get_signal(self, state: TradingState) -> Signal | None:
+        raise NotImplementedError()
+
+    def act(self, state: TradingState, traderObject) -> None:
+        traderObject.setdefault(self.symbol, {})
+        
+        traderObject[self.symbol]["signal"] = self.get_signal(state, traderObject)
+
+        position = state.position.get(self.symbol, 0)
+        order_depth = state.order_depths[self.symbol]
+
+        if traderObject[self.symbol]["signal"] == Signal.NEUTRAL:
+            if position < 0:
+                self.buy(self.get_buy_price(order_depth), -position)
+            elif position > 0:
+                self.sell(self.get_sell_price(order_depth), position)
+        elif traderObject[self.symbol]["signal"] == Signal.SHORT:
+            self.sell(self.get_sell_price(order_depth), self.limit + position)
+        elif traderObject[self.symbol]["signal"] == Signal.LONG:
+            self.buy(self.get_buy_price(order_depth), self.limit - position)
+
+    def get_buy_price(self, order_depth: OrderDepth) -> int:
+        return min(order_depth.sell_orders.keys())
+
+    def get_sell_price(self, order_depth: OrderDepth) -> int:
+        return max(order_depth.buy_orders.keys())
+
+class CroissantsStrategy(SignalStrategy):
+    def get_signal(self, state: TradingState, traderObject) -> Signal | None:
+        mid = self.filtered_mid(self.symbol, state.order_depths[self.symbol], 15)
+
+        for trade in state.market_trades.get(self.symbol, []):
+            if trade.timestamp == state.timestamp - 100:
+                if trade.buyer == "Olivia":
+                    traderObject[self.symbol]["signal"] = Signal.LONG
+                    traderObject[self.symbol]["signal_timestamp"] = state.timestamp
+                    traderObject[self.symbol]["signal_start_mid"] = mid
+                if trade.seller == "Olivia":
+                    traderObject[self.symbol]["signal"] = Signal.SHORT
+                    traderObject[self.symbol]["signal_timestamp"] = state.timestamp
+                    traderObject[self.symbol]["signal_start_mid"] = mid
+                
+        if (
+            "signal" not in traderObject[self.symbol]
+            or (
+                traderObject[self.symbol]["signal"] != Signal.NEUTRAL
+                and traderObject[self.symbol]["signal_timestamp"] < state.timestamp - 50_000
+            ) or (
+                traderObject[self.symbol]["signal"] == Signal.SHORT
+                and traderObject[self.symbol]["signal_start_mid"] < mid * 0.99
+            ) or (
+                traderObject[self.symbol]["signal"] == Signal.LONG
+                and traderObject[self.symbol]["signal_start_mid"] * 0.99 > mid
+            )
+        ):
+            traderObject[self.symbol]["signal"] = Signal.NEUTRAL
+            traderObject[self.symbol]["signal_timestamp"] = state.timestamp
+            traderObject[self.symbol]["signal_start_mid"] = mid
+
+        return traderObject[self.symbol]["signal"]
+
+class SquidInkStrategy(SignalStrategy):
+    def get_signal(self, state: TradingState, traderObject) -> Signal | None:
+        mid = self.filtered_mid(self.symbol, state.order_depths[self.symbol], 15)
+
+        for trade in state.market_trades.get(self.symbol, []):
+            if trade.timestamp == state.timestamp - 100:
+                if trade.buyer == "Olivia":
+                    traderObject[self.symbol]["signal"] = Signal.LONG
+                    traderObject[self.symbol]["signal_timestamp"] = state.timestamp
+                    traderObject[self.symbol]["signal_start_mid"] = mid
+                    traderObject[self.symbol]["is_counterparty"] = True
+                if trade.seller == "Olivia":
+                    traderObject[self.symbol]["signal"] = Signal.SHORT
+                    traderObject[self.symbol]["signal_timestamp"] = state.timestamp
+                    traderObject[self.symbol]["signal_start_mid"] = mid
+                    traderObject[self.symbol]["is_counterparty"] = True
+                
+        if (
+            "signal" not in traderObject[self.symbol]
+            or traderObject[self.symbol]["is_counterparty"] == False
+            or (
+                traderObject[self.symbol]["signal"] != Signal.NEUTRAL
+                and traderObject[self.symbol]["signal_timestamp"] < state.timestamp - 50_000
+            ) or (
+                traderObject[self.symbol]["signal"] == Signal.SHORT
+                and traderObject[self.symbol]["signal_start_mid"] < mid * 0.99
+            ) or (
+                traderObject[self.symbol]["signal"] == Signal.LONG
+                and traderObject[self.symbol]["signal_start_mid"] * 0.99 > mid
+            )
+        ):
+            traderObject[self.symbol]["signal"] = Signal.NEUTRAL
+            traderObject[self.symbol]["signal_timestamp"] = state.timestamp
+            traderObject[self.symbol]["signal_start_mid"] = mid
+            traderObject[self.symbol]["is_counterparty"] = False
+
+        window_size = 20
+        price_history = traderObject.setdefault("squid_ink_price_history", [])
+        price_history.append(mid)
+        if len(price_history) > window_size:
+            price_history.pop(0)
+
+        if traderObject[self.symbol]["signal"] == Signal.NEUTRAL and len(price_history) == window_size:
+            sorted_price_history = sorted(price_history)
+
+            # take middle 50%
+            lower_index = window_size // 4
+            upper_index = window_size - lower_index
+            middle_prices = sorted_price_history[lower_index:upper_index]  
+            
+            truncated_mean_price = sum(middle_prices) / len(middle_prices)
+
+            deviation = (mid - truncated_mean_price) / truncated_mean_price
+            deviation_threshold = 0.04
+            if deviation > deviation_threshold:
+                print("LONG", state.timestamp, mid, truncated_mean_price)
+                traderObject[self.symbol]["signal"] = Signal.LONG
+                traderObject[self.symbol]["signal_timestamp"] = state.timestamp
+                traderObject[self.symbol]["signal_start_mid"] = mid
+                traderObject[self.symbol]["is_counterparty"] = False
+            if deviation < -1 * deviation_threshold:
+                print("SHORT", state.timestamp, mid, truncated_mean_price)
+                traderObject[self.symbol]["signal"] = Signal.SHORT
+                traderObject[self.symbol]["signal_timestamp"] = state.timestamp
+                traderObject[self.symbol]["signal_start_mid"] = mid
+                traderObject[self.symbol]["is_counterparty"] = False
+
+        return traderObject[self.symbol]["signal"]
+
+class MacaronsStrategy(SignalStrategy):
+    def get_signal(self, state: TradingState, traderObject) -> Signal | None:
+        CSI = 43
+        sunlight_window = 20
+
+        macaron_observations = state.observations.conversionObservations[self.symbol]
+
+        history = traderObject.setdefault("macarons_feature_history", [])
+        history.append({
+            "sugarPrice": macaron_observations.sugarPrice,
+            "sunlightIndex": macaron_observations.sunlightIndex,
+        })
+        if len(history) > sunlight_window:
+            history.pop(0)
+
+        if macaron_observations.sunlightIndex < CSI and len(history) >= sunlight_window:
+            sunlight_now = history[-1]["sunlightIndex"]
+            sunlight_past = history[-sunlight_window]["sunlightIndex"]
+            sunlight_delta = sunlight_now - sunlight_past
+
+            if sunlight_delta < 0:
+                return Signal.LONG
+            if sunlight_delta > 0:
+                return Signal.SHORT
+
+        return Signal.NEUTRAL
 
 class Trader:
     def __init__(self, params=None):
@@ -565,57 +803,6 @@ class Trader:
             traderObject["kelp_last_price"] = mmmid_price
 
             return mmmid_price
-        return None
-    
-    def squid_ink_fair_value(self, order_depth: OrderDepth, position: int, traderObject) -> float:
-        if len(order_depth.sell_orders) != 0 and len(order_depth.buy_orders) != 0:
-            best_ask = min(order_depth.sell_orders.keys())
-            best_bid = max(order_depth.buy_orders.keys())
-            filtered_ask = [
-                price
-                for price in order_depth.sell_orders.keys()
-                if abs(order_depth.sell_orders[price])
-                >= self.params[Product.SQUID_INK]["adverse_volume"]
-            ]
-            filtered_bid = [
-                price
-                for price in order_depth.buy_orders.keys()
-                if abs(order_depth.buy_orders[price])
-                >= self.params[Product.SQUID_INK]["adverse_volume"]
-            ]
-            mm_ask = min(filtered_ask) if len(filtered_ask) > 0 else None
-            mm_bid = max(filtered_bid) if len(filtered_bid) > 0 else None
-            if mm_ask == None or mm_bid == None:
-                mmmid_price = (best_ask + best_bid) / 2
-            else:
-                mmmid_price = (mm_ask + mm_bid) / 2
-
-            if "squid_ink_price_history" not in traderObject:
-                traderObject["squid_ink_price_history"] = []
-            traderObject["squid_ink_price_history"].append(mmmid_price)
-            window_size = self.params[Product.SQUID_INK]["window_size"]
-            price_history = traderObject["squid_ink_price_history"][-window_size:]
-            traderObject["squid_ink_price_history"] = price_history
-
-            if len(price_history) == window_size:
-                sorted_price_history = sorted(price_history)
-
-                # take middle 50%
-                lower_index = window_size // 4
-                upper_index = window_size - lower_index
-                middle_prices = sorted_price_history[lower_index:upper_index]  
-                
-                truncated_mean_price = sum(middle_prices) / len(middle_prices)
-
-                deviation = (mmmid_price - truncated_mean_price) / truncated_mean_price
-                deviation_threshold = self.params[Product.SQUID_INK]["deviation_threshold"]
-                
-                if abs(deviation) > deviation_threshold:
-                    return truncated_mean_price
-
-            if position != 0:
-                return mmmid_price
-
         return None
     
     def filtered_mid(
@@ -847,180 +1034,6 @@ class Trader:
 
         return signals
 
-    def macarons_fair_value(self, order_depth, observation, position, traderObject) -> float:
-        CSI = 58
-        sunlight_window = 5
-        mid = self.filtered_mid(Product.MAGNIFICENT_MACARONS, order_depth)
-
-        if "macarons_feature_history" not in traderObject:
-            traderObject["macarons_feature_history"] = []
-        traderObject["macarons_feature_history"].append({
-            "sugarPrice": observation.sugarPrice,
-            "sunlightIndex": observation.sunlightIndex,
-        })
-        history = traderObject["macarons_feature_history"][-sunlight_window:]
-        traderObject["macarons_feature_history"] = history
-
-        if position == self.LIMIT[Product.MAGNIFICENT_MACARONS]:
-            return max(order_depth.buy_orders.keys())
-        if position == -1 * self.LIMIT[Product.MAGNIFICENT_MACARONS]:
-            return min(order_depth.sell_orders.keys())
-
-        if observation.sunlightIndex > CSI:
-            return None
-
-        if len(history) >= sunlight_window:
-            sunlight_now = history[-1]["sunlightIndex"]
-            sunlight_past = history[-sunlight_window]["sunlightIndex"]
-            sunlight_delta = sunlight_now - sunlight_past
-
-            if sunlight_delta < 0:
-                best_ask = min(order_depth.sell_orders.keys())
-                filtered_asks = [
-                    price for price in order_depth.sell_orders.keys()
-                    if abs(order_depth.sell_orders[price]) >= self.params[Product.MAGNIFICENT_MACARONS]["adverse_volume"]
-                ]
-                best_filtered_ask = min(filtered_asks) if filtered_asks else best_ask
-                return best_filtered_ask + 1
-            elif sunlight_delta > 0:
-                best_bid = max(order_depth.buy_orders.keys())
-                filtered_bids = [
-                    price for price in order_depth.buy_orders.keys()
-                    if abs(order_depth.buy_orders[price]) >= self.params[Product.MAGNIFICENT_MACARONS]["adverse_volume"]
-                ]
-                best_filtered_bid = max(filtered_bids) if filtered_bids else best_bid
-                return best_filtered_bid - 1
-
-        return mid
-    
-    def macarons_implied_bid_ask(self, observation):
-        implied_bid = observation.bidPrice - observation.exportTariff - observation.transportFees
-        implied_ask = observation.askPrice + observation.importTariff + observation.transportFees
-        return implied_bid, implied_ask
-    
-    def macarons_adap_edge(
-        self,
-        timestamp: int,
-        curr_edge: float,
-        position: int,
-        traderObject: dict
-    ) -> float: 
-        if timestamp == 0:
-            traderObject["macarons"]["curr_edge"] = self.params[Product.MAGNIFICENT_MACARONS]["init_make_edge"]
-            return self.params[Product.MAGNIFICENT_MACARONS]["init_make_edge"]
-
-        # Timestamp not 0
-        traderObject["macarons"]["volume_history"].append(abs(position))
-        if len(traderObject["macarons"]["volume_history"]) > self.params[Product.MAGNIFICENT_MACARONS]["volume_avg_timestamp"]:
-            traderObject["macarons"]["volume_history"].pop(0)
-
-        if len(traderObject["macarons"]["volume_history"]) < self.params[Product.MAGNIFICENT_MACARONS]["volume_avg_timestamp"]:
-            return curr_edge
-        elif not traderObject["macarons"]["optimized"]:
-            volume_avg = np.mean(traderObject["macarons"]["volume_history"])
-
-            # Bump up edge if consistently getting lifted full size
-            if volume_avg >= self.params[Product.MAGNIFICENT_MACARONS]["volume_bar"]:
-                traderObject["macarons"]["volume_history"] = [] # clear volume history if edge changed
-                traderObject["macarons"]["curr_edge"] = curr_edge + self.params[Product.MAGNIFICENT_MACARONS]["step_size"]
-                return curr_edge + self.params[Product.MAGNIFICENT_MACARONS]["step_size"]
-
-            # Decrement edge if more cash with less edge, included discount
-            elif self.params[Product.MAGNIFICENT_MACARONS]["dec_edge_discount"] * self.params[Product.MAGNIFICENT_MACARONS]["volume_bar"] * (curr_edge - self.params[Product.MAGNIFICENT_MACARONS]["step_size"]) > volume_avg * curr_edge:
-                if curr_edge - self.params[Product.MAGNIFICENT_MACARONS]["step_size"] > self.params[Product.MAGNIFICENT_MACARONS]["min_edge"]:
-                    traderObject["macarons"]["volume_history"] = [] # clear volume history if edge changed
-                    traderObject["macarons"]["curr_edge"] = curr_edge - self.params[Product.MAGNIFICENT_MACARONS]["step_size"]
-                    traderObject["macarons"]["optimized"] = True
-                    return curr_edge - self.params[Product.MAGNIFICENT_MACARONS]["step_size"]
-                else:
-                    traderObject["macarons"]["curr_edge"] = self.params[Product.MAGNIFICENT_MACARONS]["min_edge"]
-                    return self.params[Product.MAGNIFICENT_MACARONS]["min_edge"]
-
-        traderObject["macarons"]["curr_edge"] = curr_edge
-        return curr_edge
-    
-    def macarons_arb_take(
-        self,
-        order_depth: OrderDepth,
-        observation: ConversionObservation,
-        adap_edge: float,
-        position: int,
-    ):
-        orders: List[Order] = []
-        position_limit = self.LIMIT[Product.MAGNIFICENT_MACARONS]
-        buy_order_volume = 0
-        sell_order_volume = 0
-
-        implied_bid, implied_ask = self.macarons_implied_bid_ask(observation)
-        buy_quantity = position_limit - position
-        sell_quantity = position_limit + position
-
-        ask = implied_ask + adap_edge
-        
-        edge = (ask - implied_ask) * self.params[Product.MAGNIFICENT_MACARONS]["make_probability"]
-
-        for price in sorted(order_depth.sell_orders.keys()):
-            if price > implied_bid - edge:
-                break
-            quantity = min(abs(order_depth.sell_orders[price]), buy_quantity)
-            if quantity > 0:
-                orders.append(Order(Product.MAGNIFICENT_MACARONS, round(price), quantity))
-                buy_order_volume += quantity
-
-        for price in sorted(order_depth.buy_orders.keys(), reverse=True):
-            if price < implied_ask + edge:
-                break
-            quantity = min(abs(order_depth.buy_orders[price]), sell_quantity)
-            if quantity > 0:
-                orders.append(Order(Product.MAGNIFICENT_MACARONS, round(price), -quantity))
-                sell_order_volume += quantity
-
-        return orders, buy_order_volume, sell_order_volume
-
-    def macarons_arb_make(
-        self,
-        order_depth: OrderDepth,
-        observation: ConversionObservation,
-        position: int,
-        adap_edge: float,
-        buy_order_volume: int,
-        sell_order_volume: int,
-    ):
-        orders: List[Order] = []
-        position_limit = self.LIMIT[Product.MAGNIFICENT_MACARONS]
-
-        implied_bid, implied_ask = self.macarons_implied_bid_ask(observation)
-
-        bid = implied_bid - adap_edge
-        ask = implied_ask + adap_edge
-
-        filtered_ask = [price for price in order_depth.sell_orders.keys() if abs(order_depth.sell_orders[price]) >= 40]
-        filtered_bid = [price for price in order_depth.buy_orders.keys() if abs(order_depth.buy_orders[price]) >= 25]
-
-        if len(filtered_ask) > 0 and ask > filtered_ask[0]:
-            if filtered_ask[0] - 1 > implied_ask:
-                ask = filtered_ask[0] - 1
-            else:
-                ask = implied_ask + adap_edge
-        if len(filtered_bid) > 0 and bid < filtered_bid[0]:
-            if filtered_bid[0] + 1 < implied_bid:
-                bid = filtered_bid[0] + 1
-            else:
-                bid = implied_bid - adap_edge
-
-        buy_quantity = position_limit - (position + buy_order_volume)
-        if buy_quantity > 0:
-            orders.append(Order(Product.MAGNIFICENT_MACARONS, round(bid), buy_quantity))
-
-        sell_quantity = position_limit + (position - sell_order_volume)
-        if sell_quantity > 0:
-            orders.append(Order(Product.MAGNIFICENT_MACARONS, round(ask), -sell_quantity))
-
-        return orders, buy_order_volume, sell_order_volume
-    
-    def macarons_arb_clear(self, position: int) -> int:
-        return -position
-
     def take_orders(
         self,
         product: str,
@@ -1228,53 +1241,6 @@ class Trader:
                 kelp_take_orders + kelp_clear_orders + kelp_make_orders
             )
 
-        if Product.SQUID_INK in self.params and Product.SQUID_INK in state.order_depths:
-            squid_ink_position = (
-                state.position[Product.SQUID_INK]
-                if Product.SQUID_INK in state.position
-                else 0
-            )
-            squid_ink_fair_value = self.squid_ink_fair_value(
-                state.order_depths[Product.SQUID_INK], squid_ink_position, traderObject
-            )
-            if squid_ink_fair_value is not None:
-                squid_ink_take_orders, buy_order_volume, sell_order_volume = (
-                    self.take_orders(
-                        Product.SQUID_INK,
-                        state.order_depths[Product.SQUID_INK],
-                        squid_ink_fair_value,
-                        self.params[Product.SQUID_INK]["take_width"],
-                        squid_ink_position,
-                        self.params[Product.SQUID_INK]["prevent_adverse"],
-                        self.params[Product.SQUID_INK]["adverse_volume"],
-                    )
-                )
-                squid_ink_clear_orders, buy_order_volume, sell_order_volume = (
-                    self.clear_orders(
-                        Product.SQUID_INK,
-                        state.order_depths[Product.SQUID_INK],
-                        squid_ink_fair_value,
-                        self.params[Product.SQUID_INK]["clear_width"],
-                        squid_ink_position,
-                        buy_order_volume,
-                        sell_order_volume,
-                    )
-                )
-                squid_ink_make_orders, _, _ = self.make_orders(
-                    Product.SQUID_INK,
-                    state.order_depths[Product.SQUID_INK],
-                    squid_ink_fair_value,
-                    squid_ink_position,
-                    buy_order_volume,
-                    sell_order_volume,
-                    self.params[Product.SQUID_INK]["disregard_edge"],
-                    self.params[Product.SQUID_INK]["join_edge"],
-                    self.params[Product.SQUID_INK]["default_edge"],
-                )
-                result[Product.SQUID_INK] = (
-                    squid_ink_take_orders + squid_ink_clear_orders + squid_ink_make_orders
-                )
-
         if Product.PICNIC_BASKET1 in self.params and Product.PICNIC_BASKET1 in state.order_depths:
             basket1_position = (
                 state.position[Product.PICNIC_BASKET1]
@@ -1428,98 +1394,63 @@ class Trader:
                     
                     result[product] = take_orders + clear_orders + make_orders
 
-        conversions = 0
-        if Product.MAGNIFICENT_MACARONS in self.params \
-        and Product.MAGNIFICENT_MACARONS in state.order_depths \
-        and Product.MAGNIFICENT_MACARONS in state.observations.conversionObservations:
-            if "macarons" not in traderObject:
-                traderObject["macarons"] = {"curr_edge": self.params[Product.MAGNIFICENT_MACARONS]["init_make_edge"], "volume_history": [], "optimized": False}
-            macarons_position = (
-                state.position[Product.MAGNIFICENT_MACARONS]
-                if Product.MAGNIFICENT_MACARONS in state.position
-                else 0
-            )
-            conversions = self.macarons_arb_clear(
-                macarons_position
-            )
-            adap_edge = self.macarons_adap_edge(
-                state.timestamp,
-                traderObject["macarons"]["curr_edge"],
-                macarons_position,
-                traderObject,
-            )
-
-            macarons_position = 0
-            macarons_take_orders, buy_order_volume, sell_order_volume = self.macarons_arb_take(
-                state.order_depths[Product.MAGNIFICENT_MACARONS],
-                state.observations.conversionObservations[Product.MAGNIFICENT_MACARONS],
-                adap_edge,
-                macarons_position,
-            )
-            macarons_make_orders, _, _ = self.macarons_arb_make(
-                state.order_depths[Product.MAGNIFICENT_MACARONS],
-                state.observations.conversionObservations[Product.MAGNIFICENT_MACARONS],
-                macarons_position,
-                adap_edge,
-                buy_order_volume,
-                sell_order_volume
-            )
-            result[Product.MAGNIFICENT_MACARONS] = (
-                macarons_take_orders + macarons_make_orders
-            )
-
         # conversions = 0
         # if Product.MAGNIFICENT_MACARONS in self.params \
         # and Product.MAGNIFICENT_MACARONS in state.order_depths \
         # and Product.MAGNIFICENT_MACARONS in state.observations.conversionObservations:
+        #     if "macarons" not in traderObject:
+        #         traderObject["macarons"] = {"curr_edge": self.params[Product.MAGNIFICENT_MACARONS]["init_make_edge"], "volume_history": [], "optimized": False}
         #     macarons_position = (
         #         state.position[Product.MAGNIFICENT_MACARONS]
         #         if Product.MAGNIFICENT_MACARONS in state.position
         #         else 0
         #     )
-        #     macarons_fair_value = self.macarons_fair_value(
+        #     conversions = self.macarons_arb_clear(
+        #         macarons_position
+        #     )
+        #     adap_edge = self.macarons_adap_edge(
+        #         state.timestamp,
+        #         traderObject["macarons"]["curr_edge"],
+        #         macarons_position,
+        #         traderObject,
+        #     )
+
+        #     macarons_position = 0
+        #     macarons_take_orders, buy_order_volume, sell_order_volume = self.macarons_arb_take(
+        #         state.order_depths[Product.MAGNIFICENT_MACARONS],
+        #         state.observations.conversionObservations[Product.MAGNIFICENT_MACARONS],
+        #         adap_edge,
+        #         macarons_position,
+        #     )
+        #     macarons_make_orders, _, _ = self.macarons_arb_make(
         #         state.order_depths[Product.MAGNIFICENT_MACARONS],
         #         state.observations.conversionObservations[Product.MAGNIFICENT_MACARONS],
         #         macarons_position,
-        #         traderObject
+        #         adap_edge,
+        #         buy_order_volume,
+        #         sell_order_volume
         #     )
-        #     if macarons_fair_value is not None:
-        #         macarons_take_orders, buy_order_volume, sell_order_volume = (
-        #             self.take_orders(
-        #                 Product.MAGNIFICENT_MACARONS,
-        #                 state.order_depths[Product.MAGNIFICENT_MACARONS],
-        #                 macarons_fair_value,
-        #                 self.params[Product.MAGNIFICENT_MACARONS]["take_width"],
-        #                 macarons_position,
-        #                 self.params[Product.MAGNIFICENT_MACARONS]["prevent_adverse"],
-        #                 self.params[Product.MAGNIFICENT_MACARONS]["adverse_volume"],
-        #             )
-        #         )
-        #         macarons_clear_orders, buy_order_volume, sell_order_volume = (
-        #             self.clear_orders(
-        #                 Product.MAGNIFICENT_MACARONS,
-        #                 state.order_depths[Product.MAGNIFICENT_MACARONS],
-        #                 macarons_fair_value,
-        #                 self.params[Product.MAGNIFICENT_MACARONS]["clear_width"],
-        #                 macarons_position,
-        #                 buy_order_volume,
-        #                 sell_order_volume,
-        #             )
-        #         )
-        #         macarons_make_orders, _, _ = self.make_orders(
-        #             Product.MAGNIFICENT_MACARONS,
-        #             state.order_depths[Product.MAGNIFICENT_MACARONS],
-        #             macarons_fair_value,
-        #             macarons_position,
-        #             buy_order_volume,
-        #             sell_order_volume,
-        #             self.params[Product.MAGNIFICENT_MACARONS]["disregard_edge"],
-        #             self.params[Product.MAGNIFICENT_MACARONS]["join_edge"],
-        #             self.params[Product.MAGNIFICENT_MACARONS]["default_edge"],
-        #         )
-        #         result[Product.MAGNIFICENT_MACARONS] = (
-        #             macarons_take_orders + macarons_clear_orders + macarons_make_orders
-        #         )
+        #     result[Product.MAGNIFICENT_MACARONS] = (
+        #         macarons_take_orders + macarons_make_orders
+        #     )
+
+        conversions = 0
+
+        croissant_strategy = CroissantsStrategy(symbol=Product.CROISSANTS, limit=self.LIMIT[Product.CROISSANTS])
+        if Product.CROISSANTS in state.order_depths and len(state.order_depths[Product.CROISSANTS].buy_orders) > 0 and len(state.order_depths[Product.CROISSANTS].sell_orders) > 0:
+            strategy_orders, _ = croissant_strategy.run(state, traderObject)
+            result[Product.CROISSANTS] = strategy_orders
+
+        squid_ink_strategy = SquidInkStrategy(symbol=Product.SQUID_INK, limit=self.LIMIT[Product.SQUID_INK])
+        if Product.SQUID_INK in state.order_depths and len(state.order_depths[Product.SQUID_INK].buy_orders) > 0 and len(state.order_depths[Product.SQUID_INK].sell_orders) > 0:
+            strategy_orders, _ = squid_ink_strategy.run(state, traderObject)
+            result[Product.SQUID_INK] = strategy_orders
+
+        macarons_strategy = MacaronsStrategy(symbol=Product.MAGNIFICENT_MACARONS, limit=self.LIMIT[Product.MAGNIFICENT_MACARONS])
+        if Product.MAGNIFICENT_MACARONS in state.order_depths and len(state.order_depths[Product.MAGNIFICENT_MACARONS].buy_orders) > 0 and len(state.order_depths[Product.MAGNIFICENT_MACARONS].sell_orders) > 0:
+            strategy_orders, strategy_conversions = macarons_strategy.run(state, traderObject)
+            result[Product.MAGNIFICENT_MACARONS] = strategy_orders
+            conversions += strategy_conversions
 
         traderData = jsonpickle.encode(traderObject)
 
